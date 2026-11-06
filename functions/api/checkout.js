@@ -1,82 +1,126 @@
 
 const PRODUTOS = {
-  "nike-shox-marrom-43": {
-    nome: "Nike Shox - Marrom Escuro - 43",
-    valor: 48990
+  6: {
+    nome: "Nike Shox — Marrom Escuro",
+    valor: 48990,
+    tamanhos: ["43"]
+  },
+  2: {
+    nome: "Nike TN — Edição Iridescente",
+    valor: 44990,
+    tamanhos: ["44"]
   }
 };
 
-export async function onRequestPost({ request, env }) {
-  const json = (dados, status = 200) =>
-    new Response(JSON.stringify(dados), {
-      status,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store"
-      }
-    });
+const responder = (dados, status = 200) =>
+  new Response(JSON.stringify(dados), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    }
+  });
 
+export async function onRequestPost({ request, env }) {
   if (!env.PAGBANK_TOKEN) {
-    return json({ erro: "Token PagBank não configurado" }, 503);
+    return responder(
+      { erro: "Token PagBank não configurado" },
+      503
+    );
   }
 
   let pedido;
+
   try {
     pedido = await request.json();
   } catch {
-    return json({ erro: "JSON inválido" }, 400);
+    return responder({ erro: "JSON inválido" }, 400);
   }
 
-  const produto = PRODUTOS[pedido.produtoId];
-  const quantidade = pedido.quantidade;
+  if (!Array.isArray(pedido.items) ||
+      pedido.items.length === 0 ||
+      pedido.items.length > 20) {
+    return responder({ erro: "Carrinho inválido" }, 400);
+  }
 
-  if (!produto || !Number.isInteger(quantidade) ||
-      quantidade < 1 || quantidade > 5) {
-    return json({ erro: "Produto ou quantidade inválida" }, 400);
+  const itens = [];
+
+  for (const item of pedido.items) {
+    const produto = PRODUTOS[item.id];
+
+    if (!produto ||
+        !Number.isInteger(item.quantity) ||
+        item.quantity < 1 ||
+        item.quantity > 5 ||
+        !produto.tamanhos.includes(String(item.size))) {
+      return responder(
+        { erro: "Produto, tamanho ou quantidade inválida" },
+        400
+      );
+    }
+
+    itens.push({
+      reference_id: String(item.id) + "-" + item.size,
+      name: produto.nome + " - Tamanho " + item.size,
+      quantity: item.quantity,
+      unit_amount: produto.valor
+    });
   }
 
   const referencia = "UK-" + crypto.randomUUID();
 
-  const resposta = await fetch(
-    "https://api.pagseguro.com/checkouts",
-    {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.PAGBANK_TOKEN}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      body: JSON.stringify({
-        reference_id: referencia,
-        items: [{
-          reference_id: pedido.produtoId,
-          name: produto.nome,
-          quantity: quantidade,
-          unit_amount: produto.valor
-        }],
-        payment_methods: [
-          { type: "PIX" },
-          { type: "CREDIT_CARD" }
-        ],
-        return_url: "https://urban-kicks.pages.dev/"
-      })
+  try {
+    const resposta = await fetch(
+      "https://api.pagseguro.com/checkouts",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.PAGBANK_TOKEN}`,
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({
+          reference_id: referencia,
+          items: itens,
+          payment_methods: [
+            { type: "PIX" },
+            { type: "CREDIT_CARD" }
+          ],
+          return_url: "https://urban-kicks.pages.dev/"
+        })
+      }
+    );
+
+    const dados = await resposta.json().catch(() => ({}));
+
+    if (!resposta.ok) {
+      return responder({
+        erro: "PagBank recusou a criação do checkout",
+        statusPagBank: resposta.status,
+        detalhes: dados.error_messages || dados.message || null
+      }, 502);
     }
-  );
 
-  const dados = await resposta.json().catch(() => ({}));
+    const link = dados.links?.find(
+      item => item.rel === "PAY"
+    )?.href;
 
-  if (!resposta.ok) {
-    return json({
-      erro: "PagBank recusou a criação do checkout",
-      statusPagBank: resposta.status
-    }, 502);
+    if (!link || !link.startsWith("https://")) {
+      return responder(
+        { erro: "Link de pagamento não recebido" },
+        502
+      );
+    }
+
+    return responder({
+      checkoutUrl: link,
+      referencia
+    });
+
+  } catch {
+    return responder(
+      { erro: "Falha de comunicação com PagBank" },
+      502
+    );
   }
-
-  const link = dados.links?.find(item => item.rel === "PAY")?.href;
-
-  if (!link || !link.startsWith("https://")) {
-    return json({ erro: "Link de pagamento não recebido" }, 502);
-  }
-
-  return json({ checkoutUrl: link, referencia });
 }

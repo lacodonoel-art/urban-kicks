@@ -19,12 +19,12 @@ const sizes=Array.from({length:11},(_,i)=>i+34);const key='urban-kicks-demo-v2';
   const items=cart.map(x=>({id:x.id,size:String(x.size),quantity:Number(x.qty)}));
   const response=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items})});
   const result=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(result.error||result.message||'Não foi possível iniciar o pagamento.');
-  const url=result.checkout_url||result.payment_url||result.redirect_url||result.pay_url||result.url||result.links?.find(x=>x.rel==='PAY'||x.rel==='pay')?.href;
-  if(!url)throw new Error('A API não retornou o link de pagamento. Verifique a função do Cloudflare.');
-  const parsed=new URL(url,location.origin);
-  if(parsed.protocol!=='https:')throw new Error('Link de pagamento inválido.');
-  location.assign(parsed.href);
+  if(!response.ok)throw new Error(result.erro||result.error||result.message||'Não foi possível iniciar o pagamento.');
+  const url=result.checkoutUrl;
+  if(typeof url!=='string'||!url)throw new Error('A API não retornou checkoutUrl. Verifique a função do Cloudflare.');
+  const parsed=new URL(url);
+  if(parsed.protocol!=='https:'||!['pagamento.sandbox.pagbank.com.br','pagamento.pagbank.com.br'].includes(parsed.hostname))throw new Error('Link de pagamento inválido.');
+  window.location.assign(parsed.href);
  }catch(error){console.error('Erro no checkout:',error);alert('Pagamento não iniciado: '+error.message);}
  finally{if(button){button.disabled=false;button.textContent='Pagar com PagBank';}}
 }

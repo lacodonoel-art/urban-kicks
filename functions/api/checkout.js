@@ -71,7 +71,7 @@ export async function onRequestPost({ request, env }) {
 
   try {
     const resposta = await fetch(
-      "https://api.pagseguro.com/checkouts",
+      "https://sandbox.api.pagseguro.com/checkouts",
       {
         method: "POST",
         headers: {

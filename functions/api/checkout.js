@@ -1,32 +1,30 @@
 
+ // Cloudflare Pages Function — PagBank Sandbox
+ // Preços em centavos, validados no servidor.
+
 const PRODUTOS = {
-  6: {
-    nome: "Nike Shox — Marrom Escuro",
-    valor: 48990,
-    tamanhos: ["43"]
-  },
-  2: {
-    nome: "Nike TN — Edição Iridescente",
-    valor: 44990,
-    tamanhos: ["44"]
-  }
+  1: { nome: 'New Balance — Cinza Urbano', valor: 39990 },
+  2: { nome: 'Nike TN — Edição Iridescente', valor: 44990 },
+  3: { nome: 'Nike Air Max Plus — Preto e Prata', valor: 42990 },
+  4: { nome: 'Nike Shox — Total Black', valor: 49990 },
+  5: { nome: 'Nike Air Max Plus — Blue Gradient', valor: 44990 },
+  6: { nome: 'Nike Shox — Marrom Escuro', valor: 48990 },
+  7: { nome: 'Nike P-6000 — Branco', valor: 37990 },
+  8: { nome: 'Nike P-6000 — Branco Lateral', valor: 37990 }
 };
 
 const responder = (dados, status = 200) =>
   new Response(JSON.stringify(dados), {
     status,
     headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store"
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store'
     }
   });
 
 export async function onRequestPost({ request, env }) {
   if (!env.PAGBANK_TOKEN) {
-    return responder(
-      { erro: "Token PagBank não configurado" },
-      503
-    );
+    return responder({ erro: 'Token PagBank não configurado' }, 503);
   }
 
   let pedido;
@@ -34,59 +32,88 @@ export async function onRequestPost({ request, env }) {
   try {
     pedido = await request.json();
   } catch {
-    return responder({ erro: "JSON inválido" }, 400);
+    return responder({ erro: 'JSON inválido' }, 400);
   }
 
-  if (!Array.isArray(pedido.items) ||
-      pedido.items.length === 0 ||
-      pedido.items.length > 20) {
-    return responder({ erro: "Carrinho inválido" }, 400);
+  if (
+    !pedido ||
+    !Array.isArray(pedido.items) ||
+    pedido.items.length < 1 ||
+    pedido.items.length > 20
+  ) {
+    return responder({ erro: 'Carrinho inválido' }, 400);
   }
 
-  const itens = [];
+  const agrupados = new Map();
 
   for (const item of pedido.items) {
-    const produto = PRODUTOS[item.id];
+    const id = Number(item?.id);
+    const tamanho = String(item?.size ?? '');
+    const quantidade = item?.quantity;
 
-    if (!produto ||
-        !Number.isInteger(item.quantity) ||
-        item.quantity < 1 ||
-        item.quantity > 5 ||
-        !produto.tamanhos.includes(String(item.size))) {
+    if (
+      !Number.isInteger(id) ||
+      !PRODUTOS[id] ||
+      !/^\d{2}$/.test(tamanho) ||
+      Number(tamanho) < 34 ||
+      Number(tamanho) > 44 ||
+      !Number.isInteger(quantidade) ||
+      quantidade < 1 ||
+      quantidade > 5
+    ) {
       return responder(
-        { erro: "Produto, tamanho ou quantidade inválida" },
+        { erro: 'Produto, tamanho ou quantidade inválida' },
         400
       );
     }
 
-    itens.push({
-      reference_id: String(item.id) + "-" + item.size,
-      name: produto.nome + " - Tamanho " + item.size,
-      quantity: item.quantity,
-      unit_amount: produto.valor
+    const chave = `${id}-${tamanho}`;
+    const total =
+      (agrupados.get(chave)?.quantity || 0) + quantidade;
+
+    if (total > 5) {
+      return responder(
+        { erro: 'Limite de 5 unidades por produto e tamanho' },
+        400
+      );
+    }
+
+    agrupados.set(chave, {
+      id,
+      tamanho,
+      quantity: total
     });
   }
 
-  const referencia = "UK-" + crypto.randomUUID();
+  const itens = [...agrupados.values()].map(
+    ({ id, tamanho, quantity }) => ({
+      reference_id: `${id}-${tamanho}`,
+      name: `${PRODUTOS[id].nome} - Tamanho ${tamanho}`,
+      quantity,
+      unit_amount: PRODUTOS[id].valor
+    })
+  );
+
+  const referencia = `UK-${crypto.randomUUID()}`;
 
   try {
     const resposta = await fetch(
-      "https://sandbox.api.pagseguro.com/checkouts",
+      'https://sandbox.api.pagseguro.com/checkouts',
       {
-        method: "POST",
+        method: 'POST',
         headers: {
-          "Authorization": `Bearer ${env.PAGBANK_TOKEN}`,
-          "Content-Type": "application/json",
-          "Accept": "application/json"
+          Authorization: `Bearer ${env.PAGBANK_TOKEN}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
         },
         body: JSON.stringify({
           reference_id: referencia,
           items: itens,
           payment_methods: [
-            { type: "PIX" },
-            { type: "CREDIT_CARD" }
+            { type: 'PIX' },
+            { type: 'CREDIT_CARD' }
           ],
-          return_url: "https://urban-kicks.pages.dev/"
+          return_url: 'https://urban-kicks.pages.dev/'
         })
       }
     );
@@ -95,19 +122,24 @@ export async function onRequestPost({ request, env }) {
 
     if (!resposta.ok) {
       return responder({
-        erro: "PagBank recusou a criação do checkout",
+        erro: 'PagBank recusou a criação do checkout',
         statusPagBank: resposta.status,
         detalhes: dados.error_messages || dados.message || null
       }, 502);
     }
 
     const link = dados.links?.find(
-      item => item.rel === "PAY"
+      x => x.rel === 'PAY'
     )?.href;
 
-    if (!link || !link.startsWith("https://")) {
+    if (
+      typeof link !== 'string' ||
+      !link.startsWith(
+        'https://pagamento.sandbox.pagbank.com.br/'
+      )
+    ) {
       return responder(
-        { erro: "Link de pagamento não recebido" },
+        { erro: 'Link de pagamento Sandbox não recebido' },
         502
       );
     }
@@ -119,7 +151,7 @@ export async function onRequestPost({ request, env }) {
 
   } catch {
     return responder(
-      { erro: "Falha de comunicação com PagBank" },
+      { erro: 'Falha de comunicação com PagBank' },
       502
     );
   }

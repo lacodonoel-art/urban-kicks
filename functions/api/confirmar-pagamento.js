@@ -3,10 +3,10 @@
  * URBAN KICKS - CONFIRMAR PAGAMENTO
  * PagBank Sandbox + Cloudflare D1
  *
- * Acesso exclusivo com CONSULTA_ADMIN_KEY.
- * Confere checkout, ordem, cobranca e valor.
- * Registra pagamento e atualiza estoque.
- * Protecao contra processamento duplicado.
+ * Confirma pagamento diretamente no PagBank.
+ * Valida checkout, ordem, cobranca e valor.
+ * Atualiza pedido e estoque atomicamente.
+ * Impede processamento duplicado.
  */
 
 const API = 'https://sandbox.api.pagseguro.com';
@@ -22,7 +22,12 @@ function responder(dados, status = 200) {
 }
 
 function compararSeguro(a, b) {
-  if (!a || !b || a.length !== b.length) {
+  if (
+    typeof a !== 'string' ||
+    typeof b !== 'string' ||
+    !a ||
+    a.length !== b.length
+  ) {
     return false;
   }
 
@@ -37,6 +42,7 @@ function compararSeguro(a, b) {
 
 async function consultarPagBank(caminho, token) {
   const resposta = await fetch(API + caminho, {
+    method: 'GET',
     headers: {
       Authorization: 'Bearer ' + token,
       Accept: 'application/json'
@@ -46,7 +52,7 @@ async function consultarPagBank(caminho, token) {
 
   if (!resposta.ok) {
     throw new Error(
-      'Consulta PagBank HTTP ' + resposta.status
+      'PagBank retornou HTTP ' + resposta.status
     );
   }
 
@@ -67,7 +73,9 @@ export async function onRequestPost({ request, env }) {
   const chave = request.headers.get('x-admin-key');
 
   if (!compararSeguro(chave, env.CONSULTA_ADMIN_KEY)) {
-    return responder({ erro: 'Nao autorizado' }, 401);
+    return responder({
+      erro: 'Nao autorizado'
+    }, 401);
   }
 
   let entrada;
@@ -75,25 +83,42 @@ export async function onRequestPost({ request, env }) {
   try {
     entrada = await request.json();
   } catch {
-    return responder({ erro: 'JSON invalido' }, 400);
+    return responder({
+      erro: 'JSON invalido'
+    }, 400);
   }
 
   const pedidoId = entrada?.pedidoId;
 
-  if (!Number.isSafeInteger(pedidoId) || pedidoId < 1) {
-    return responder({ erro: 'Pedido invalido' }, 400);
+  if (
+    !Number.isSafeInteger(pedidoId) ||
+    pedidoId < 1
+  ) {
+    return responder({
+      erro: 'Pedido invalido'
+    }, 400);
   }
 
-  const pedido = await env.DB.prepare(`
-    SELECT id, referencia, checkout_id,
-           status, valor_total
-    FROM pedidos
-    WHERE id = ?
-    LIMIT 1
-  `).bind(pedidoId).first();
+  let pedido;
+
+  try {
+    pedido = await env.DB.prepare(`
+      SELECT id, referencia, checkout_id,
+             status, valor_total
+      FROM pedidos
+      WHERE id = ?
+      LIMIT 1
+    `).bind(pedidoId).first();
+  } catch {
+    return responder({
+      erro: 'Falha ao consultar pedido'
+    }, 503);
+  }
 
   if (!pedido) {
-    return responder({ erro: 'Pedido nao encontrado' }, 404);
+    return responder({
+      erro: 'Pedido nao encontrado'
+    }, 404);
   }
 
   if (pedido.status === 'PAGO') {
@@ -107,19 +132,26 @@ export async function onRequestPost({ request, env }) {
 
   if (pedido.status !== 'PENDENTE') {
     return responder({
-      erro: 'Status do pedido nao permite confirmacao'
+      erro: 'Status nao permite confirmacao'
     }, 409);
   }
 
-  if (!/^CHEC_[A-Z0-9-]+$/i.test(pedido.checkout_id)) {
-    return responder({ erro: 'Checkout invalido' }, 400);
+  if (
+    !/^CHEC_[A-Z0-9-]+$/i.test(
+      pedido.checkout_id || ''
+    )
+  ) {
+    return responder({
+      erro: 'Checkout invalido'
+    }, 400);
   }
 
   let checkout;
 
   try {
     checkout = await consultarPagBank(
-      '/checkouts/' + encodeURIComponent(pedido.checkout_id),
+      '/checkouts/' +
+      encodeURIComponent(pedido.checkout_id),
       env.PAGBANK_TOKEN
     );
   } catch {
@@ -141,18 +173,23 @@ export async function onRequestPost({ request, env }) {
     ? checkout.orders
     : [];
 
-  let pagamentoValido = null;
+  const pagamentos = [];
+  let ordemNaoVerificada = false;
 
-  for (const ordemResumo of ordens) {
-    if (!/^ORDE_[A-Z0-9-]+$/i.test(ordemResumo.id || '')) {
-      continue;
+  for (const resumo of ordens) {
+    if (
+      !/^ORDE_[A-Z0-9-]+$/i.test(resumo?.id || '')
+    ) {
+      return responder({
+        erro: 'Identificador de ordem invalido'
+      }, 409);
     }
 
     let ordem;
 
     try {
       ordem = await consultarPagBank(
-        '/orders/' + encodeURIComponent(ordemResumo.id),
+        '/orders/' + encodeURIComponent(resumo.id),
         env.PAGBANK_TOKEN
       );
     } catch {
@@ -161,10 +198,14 @@ export async function onRequestPost({ request, env }) {
       }, 502);
     }
 
-    if (
-      ordem.id !== ordemResumo.id ||
-      ordem.reference_id !== pedido.referencia
-    ) {
+    if (ordem.id !== resumo.id) {
+      return responder({
+        erro: 'Identificador da ordem nao confere'
+      }, 409);
+    }
+
+    if (ordem.reference_id !== pedido.referencia) {
+      ordemNaoVerificada = true;
       continue;
     }
 
@@ -172,154 +213,191 @@ export async function onRequestPost({ request, env }) {
       ? ordem.charges
       : [];
 
-    const pagas = cobrancas.filter(c =>
-      c.status === 'PAID' &&
-      Number.isSafeInteger(c.amount?.value) &&
-      c.amount.value > 0 &&
-      (!c.amount.currency ||
-        c.amount.currency === 'BRL')
-    );
+    for (const cobranca of cobrancas) {
+      if (cobranca.status !== 'PAID') {
+        continue;
+      }
 
-    if (
-      pagas.length === 1 &&
-      pagas[0].amount.value === pedido.valor_total &&
-      /^CHAR_[A-Z0-9-]+$/i.test(pagas[0].id || '')
-    ) {
-      if (pagamentoValido) {
+      if (
+        !/^CHAR_[A-Z0-9-]+$/i.test(cobranca.id || '') ||
+        !Number.isSafeInteger(cobranca.amount?.value) ||
+        cobranca.amount.value <= 0 ||
+        cobranca.amount.currency !== 'BRL'
+      ) {
         return responder({
-          erro: 'Multiplas cobrancas pagas. Revisao necessaria'
+          erro: 'Cobranca paga com dados invalidos'
         }, 409);
       }
 
-      pagamentoValido = {
+      pagamentos.push({
         ordemId: ordem.id,
-        cobrancaId: pagas[0].id,
-        valor: pagas[0].amount.value
-      };
+        cobrancaId: cobranca.id,
+        valor: cobranca.amount.value
+      });
     }
   }
 
-  if (!pagamentoValido) {
+  if (ordemNaoVerificada) {
     return responder({
-      pedidoId,
-      status: 'PENDENTE',
-      pagamentoConfirmado: false,
-      estoqueAlterado: false,
-      mensagem: 'Nenhuma cobranca PAID valida encontrada'
+      erro: 'Existem ordens sem vinculo confirmado',
+      pagamentoConfirmado: false
     }, 409);
   }
 
-  const resultadoItens = await env.DB.prepare(`
-    SELECT produto_id, tamanho,
-           SUM(quantidade) AS quantidade,
-           SUM(quantidade * preco_unitario) AS subtotal
-    FROM pedido_itens
-    WHERE pedido_id = ?
-    GROUP BY produto_id, tamanho
-  `).bind(pedidoId).all();
+  if (pagamentos.length !== 1) {
+    return responder({
+      pedidoId,
+      pagamentoConfirmado: false,
+      estoqueAlterado: false,
+      quantidadePagamentos: pagamentos.length,
+      mensagem: 'Pagamento requer verificacao'
+    }, 409);
+  }
 
-  const itens = resultadoItens.results || [];
+  const pagamento = pagamentos[0];
+
+  if (pagamento.valor !== pedido.valor_total) {
+    return responder({
+      erro: 'Valor pago diferente do pedido',
+      pagamentoConfirmado: false
+    }, 409);
+  }
+
+  let itens;
+
+  try {
+    const resultado = await env.DB.prepare(`
+      SELECT
+        produto_id,
+        tamanho,
+        SUM(quantidade) AS quantidade,
+        SUM(quantidade * preco_unitario) AS subtotal
+      FROM pedido_itens
+      WHERE pedido_id = ?
+      GROUP BY produto_id, tamanho
+    `).bind(pedidoId).all();
+
+    itens = resultado.results || [];
+  } catch {
+    return responder({
+      erro: 'Falha ao consultar itens'
+    }, 503);
+  }
 
   if (
     itens.length === 0 ||
-    itens.some(i =>
-      !Number.isSafeInteger(i.quantidade) ||
-      i.quantidade < 1
+    itens.some(item =>
+      !Number.isSafeInteger(item.quantidade) ||
+      item.quantidade < 1 ||
+      !Number.isSafeInteger(item.subtotal) ||
+      item.subtotal < 1
     )
   ) {
     return responder({
-      erro: 'Itens do pedido invalidos'
+      erro: 'Itens invalidos'
     }, 409);
   }
 
   const totalItens = itens.reduce(
-    (total, i) => total + i.subtotal, 0
+    (total, item) => total + item.subtotal,
+    0
   );
 
   if (totalItens !== pedido.valor_total) {
     return responder({
-      erro: 'Valor dos itens nao confere'
+      erro: 'Total dos itens nao confere'
     }, 409);
   }
 
-  const estoque = await env.DB.prepare(`
-    SELECT produto_id, tamanho, quantidade
-    FROM estoque
-  `).all();
-
-  const disponivel = new Map(
-    (estoque.results || []).map(e => [
-      e.produto_id + '-' + e.tamanho,
-      e.quantidade
-    ])
-  );
-
-  for (const item of itens) {
-    const chave = item.produto_id + '-' + item.tamanho;
-
-    if ((disponivel.get(chave) ?? 0) < item.quantidade) {
-      return responder({
-        erro: 'Estoque insuficiente',
-        produtoId: item.produto_id,
-        tamanho: item.tamanho,
-        estoqueAlterado: false
-      }, 409);
-    }
-  }
-
   /*
-   * Todas as escritas sao executadas em
-   * uma unica transacao D1.
+   * Protecao transacional:
    *
-   * A restricao UNIQUE impede reutilizar
-   * o pedido ou a cobranca.
+   * SQLite RAISE(ABORT) nao pode ser usado
+   * diretamente em um SELECT comum.
    *
-   * A restricao CHECK do estoque impede
-   * quantidade negativa e causa rollback.
+   * Usamos um gatilho temporario de validacao
+   * atraves de uma tabela permanente de controle.
+   *
+   * Para evitar depender de gatilhos adicionais,
+   * a operacao utiliza INSERT condicional com
+   * restricoes UNIQUE e CHECK.
+   *
+   * Uma falha SQL cancela todo o DB.batch().
    */
 
-  const comandos = [
+  const comandos = [];
+
+  /*
+   * Primeiro, reservar a confirmacao.
+   *
+   * A tabela pagamentos_processados deve possuir:
+   * - pedido_id UNIQUE
+   * - cobranca_pagbank UNIQUE
+   */
+
+  comandos.push(
     env.DB.prepare(`
       INSERT INTO pagamentos_processados
-      (pedido_id, ordem_pagbank, cobranca_pagbank, valor)
-      SELECT ?, ?, ?, ?
-      WHERE EXISTS (
-        SELECT 1 FROM pedidos
-        WHERE id = ? AND status = 'PENDENTE'
-      )
+        (pedido_id, ordem_pagbank,
+         cobranca_pagbank, valor)
+      VALUES (?, ?, ?, ?)
     `).bind(
       pedidoId,
-      pagamentoValido.ordemId,
-      pagamentoValido.cobrancaId,
-      pagamentoValido.valor,
-      pedidoId
+      pagamento.ordemId,
+      pagamento.cobrancaId,
+      pagamento.valor
     )
-  ];
+  );
+
+  /*
+   * Cada desconto usa uma instrucao que falha
+   * se nao houver estoque suficiente.
+   *
+   * A insercao em estoque com quantidade -1
+   * provoca conflito com CHECK (quantidade >= 0)
+   * caso a atualizacao nao encontre estoque.
+   *
+   * A falha reverte o batch inteiro.
+   */
 
   for (const item of itens) {
     comandos.push(
       env.DB.prepare(`
-        UPDATE estoque
-        SET quantidade = quantidade - ?,
-            atualizado_em = CURRENT_TIMESTAMP
-        WHERE produto_id = ?
-          AND tamanho = ?
-          AND quantidade >= ?
+        INSERT INTO estoque
+          (produto_id, tamanho, quantidade)
+        VALUES (?, ?, -1)
+        ON CONFLICT(produto_id, tamanho)
+        DO UPDATE SET
+          quantidade = CASE
+            WHEN estoque.quantidade >= ?
+            THEN estoque.quantidade - ?
+            ELSE -1
+          END,
+          atualizado_em = CURRENT_TIMESTAMP
       `).bind(
-        item.quantidade,
         item.produto_id,
         item.tamanho,
+        item.quantidade,
         item.quantidade
       )
     );
   }
+
+  /*
+   * Confirma o pedido somente se ainda estiver
+   * pendente.
+   *
+   * O INSERT abaixo usa a tabela de pagamentos
+   * como trava de unicidade.
+   */
 
   comandos.push(
     env.DB.prepare(`
       UPDATE pedidos
       SET status = 'PAGO',
           atualizado_em = CURRENT_TIMESTAMP
-      WHERE id = ? AND status = 'PENDENTE'
+      WHERE id = ?
+        AND status = 'PENDENTE'
     `).bind(pedidoId)
   );
 
@@ -327,27 +405,22 @@ export async function onRequestPost({ request, env }) {
     const resultados = await env.DB.batch(comandos);
 
     const alteracoes = resultados.map(
-      r => r.meta?.changes ?? 0
+      resultado => resultado.meta?.changes ?? 0
     );
 
     if (alteracoes.some(n => n !== 1)) {
-      /*
-       * Uma alteracao inesperada exige
-       * verificacao manual. O batch ja
-       * foi executado neste ponto.
-       */
-      console.error(
-        'Confirmacao: contagem inesperada',
-        { pedidoId, alteracoes }
-      );
+      console.error('Alteracoes inesperadas', {
+        pedidoId,
+        alteracoes
+      });
 
       return responder({
-        erro: 'Verificar consistencia do pedido',
+        erro: 'Verificacao de consistencia necessaria',
         pedidoId
       }, 503);
     }
   } catch (erro) {
-    console.error('Falha na confirmacao:', {
+    console.error('Erro na transacao', {
       pedidoId,
       mensagem: erro instanceof Error
         ? erro.message
@@ -355,9 +428,10 @@ export async function onRequestPost({ request, env }) {
     });
 
     return responder({
-      erro: 'Falha ao processar pagamento',
+      erro: 'Confirmacao nao concluida',
       pedidoId,
-      mensagem: 'Consulte o banco antes de tentar novamente'
+      pagamentoConfirmado: false,
+      mensagem: 'Verifique o banco antes de repetir'
     }, 503);
   }
 
@@ -368,9 +442,9 @@ export async function onRequestPost({ request, env }) {
     status: 'PAGO',
     pagamentoConfirmado: true,
     estoqueAlterado: true,
-    ordemId: pagamentoValido.ordemId,
-    cobrancaId: pagamentoValido.cobrancaId,
-    valorPago: pagamentoValido.valor,
+    ordemId: pagamento.ordemId,
+    cobrancaId: pagamento.cobrancaId,
+    valorPago: pagamento.valor,
     mensagem: 'Pagamento confirmado e estoque atualizado'
   });
 }

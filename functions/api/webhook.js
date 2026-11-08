@@ -1,14 +1,13 @@
 
-```javascript
-// Urban Kicks — Webhook PagBank Sandbox
-// Valida a autenticidade das notificações.
-// Ainda não altera estoque nem registra pedidos em banco de dados.
+// Urban Kicks - Webhook PagBank Sandbox
+// Recebe notificacoes e verifica a autenticidade.
+// Nao confirma pedidos nem altera estoque nesta etapa.
 
 const API = 'https://sandbox.api.pagseguro.com';
 
 function responder(dados, status = 200) {
   return new Response(JSON.stringify(dados), {
-    status,
+    status: status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store'
@@ -16,290 +15,162 @@ function responder(dados, status = 200) {
   });
 }
 
-function bytesBase64(valor) {
-  const binario = atob(valor);
-  return Uint8Array.from(binario, c => c.charCodeAt(0));
+function hex(buffer) {
+  return Array.from(new Uint8Array(buffer))
+    .map(function (byte) {
+      return byte.toString(16).padStart(2, '0');
+    })
+    .join('');
 }
 
-async function validarAssinaturaAntiga(corpo, assinatura, token) {
-  if (!/^[a-f0-9]{64}$/i.test(assinatura)) return false;
+function compararSeguro(a, b) {
+  if (
+    typeof a !== 'string' ||
+    typeof b !== 'string' ||
+    a.length !== b.length
+  ) {
+    return false;
+  }
 
-  const texto = `${token}-${corpo}`;
-  const hash = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(texto)
-  );
-
-  const calculado = [...new Uint8Array(hash)]
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-
-  // Comparação sem saída antecipada.
   let diferenca = 0;
-  const recebido = assinatura.toLowerCase();
 
-  for (let i = 0; i < calculado.length; i++) {
-    diferenca |= calculado.charCodeAt(i) ^
-      recebido.charCodeAt(i);
+  for (let i = 0; i < a.length; i++) {
+    diferenca |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
 
   return diferenca === 0;
 }
 
-async function validarAssinaturaNova(corpo, assinaturas, token) {
-  const resposta = await fetch(
-    `${API}/public-keys?type=webhook`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/json'
-      }
-    }
+async function validarAssinatura(corpo, assinatura, token) {
+  if (
+    typeof assinatura !== 'string' ||
+    !/^[a-f0-9]{64}$/i.test(assinatura)
+  ) {
+    return false;
+  }
+
+  const mensagem = token + '-' + corpo;
+
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(mensagem)
   );
 
-  if (!resposta.ok) {
-    throw new Error('Chave pública indisponível');
-  }
-
-  const dados = await resposta.json();
-
-  if (!dados.public_key) {
-    throw new Error('Chave pública ausente');
-  }
-
-  const chave = await crypto.subtle.importKey(
-    'spki',
-    bytesBase64(dados.public_key),
-    {
-      name: 'ECDSA',
-      namedCurve: 'P-256'
-    },
-    false,
-    ['verify']
+  return compararSeguro(
+    hex(digest),
+    assinatura.toLowerCase()
   );
-
-  const mensagem = new TextEncoder().encode(corpo);
-
-  for (const assinatura of assinaturas) {
-    try {
-      // Assinatura DER recebida do PagBank.
-      // Converte para o formato IEEE P1363 do Web Crypto.
-      const der = bytesBase64(assinatura);
-      const p1363 = derParaP1363(der);
-
-      const valida = await crypto.subtle.verify(
-        {
-          name: 'ECDSA',
-          hash: 'SHA-256'
-        },
-        chave,
-        p1363,
-        mensagem
-      );
-
-      if (valida) return true;
-    } catch {
-      // Tenta a próxima assinatura.
-    }
-  }
-
-  return false;
-}
-
-function derParaP1363(der) {
-  let pos = 0;
-
-  function tamanho() {
-    let n = der[pos++];
-
-    if (n < 128) return n;
-
-    const bytes = n & 0x7f;
-
-    if (bytes < 1 || bytes > 2) {
-      throw new Error('DER inválido');
-    }
-
-    n = 0;
-
-    for (let i = 0; i < bytes; i++) {
-      n = (n << 8) | der[pos++];
-    }
-
-    return n;
-  }
-
-  if (der[pos++] !== 0x30) {
-    throw new Error('DER inválido');
-  }
-
-  const comprimento = tamanho();
-
-  if (pos + comprimento !== der.length) {
-    throw new Error('DER inválido');
-  }
-
-  function inteiro() {
-    if (der[pos++] !== 0x02) {
-      throw new Error('Inteiro DER inválido');
-    }
-
-    const n = tamanho();
-    const valor = der.slice(pos, pos + n);
-    pos += n;
-
-    if (!n || n > 33 || valor.length !== n) {
-      throw new Error('Inteiro DER inválido');
-    }
-
-    let inicio = 0;
-
-    while (
-      inicio < valor.length - 1 &&
-      valor[inicio] === 0
-    ) {
-      inicio++;
-    }
-
-    const numero = valor.slice(inicio);
-
-    if (numero.length > 32) {
-      throw new Error('Inteiro grande demais');
-    }
-
-    const saida = new Uint8Array(32);
-    saida.set(numero, 32 - numero.length);
-
-    return saida;
-  }
-
-  const r = inteiro();
-  const s = inteiro();
-
-  if (pos !== der.length) {
-    throw new Error('DER com dados extras');
-  }
-
-  const resultado = new Uint8Array(64);
-  resultado.set(r, 0);
-  resultado.set(s, 32);
-
-  return resultado;
 }
 
 export async function onRequestPost({ request, env }) {
   if (!env.PAGBANK_TOKEN) {
-    return responder(
-      { erro: 'Token PagBank não configurado' },
-      503
-    );
+    return responder({
+      erro: 'Token PagBank nao configurado'
+    }, 503);
   }
 
-  const corpo = await request.text();
+  const tamanhoMaximo = 200000;
 
-  if (!corpo || corpo.length > 200000) {
-    return responder({ erro: 'Corpo inválido' }, 400);
+  const tamanhoInformado = Number(
+    request.headers.get('content-length')
+  );
+
+  if (tamanhoInformado > tamanhoMaximo) {
+    return responder({
+      erro: 'Notificacao muito grande'
+    }, 413);
   }
 
-  const assinaturaNova =
-    request.headers.get('x-payload-signature');
-
-  const assinaturaAntiga =
-    request.headers.get('x-authenticity-token');
-
-  if (!assinaturaNova && !assinaturaAntiga) {
-    return responder(
-      { erro: 'Assinatura ausente' },
-      401
-    );
-  }
-
-  let autentico = false;
+  let corpo;
 
   try {
-    if (assinaturaNova) {
-      const assinaturas = assinaturaNova
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-
-      autentico = await validarAssinaturaNova(
-        corpo,
-        assinaturas,
-        env.PAGBANK_TOKEN
-      );
-    } else {
-      autentico = await validarAssinaturaAntiga(
-        corpo,
-        assinaturaAntiga,
-        env.PAGBANK_TOKEN
-      );
-    }
-  } catch {
-    return responder(
-      { erro: 'Não foi possível validar a assinatura' },
-      503
-    );
+    corpo = await request.text();
+  } catch (erro) {
+    return responder({
+      erro: 'Nao foi possivel ler a notificacao'
+    }, 400);
   }
 
-  if (!autentico) {
-    return responder(
-      { erro: 'Assinatura inválida' },
-      401
+  if (!corpo || corpo.length > tamanhoMaximo) {
+    return responder({
+      erro: 'Corpo da notificacao invalido'
+    }, 400);
+  }
+
+  const assinatura = request.headers.get(
+    'x-authenticity-token'
+  );
+
+  if (!assinatura) {
+    return responder({
+      erro: 'Assinatura ausente'
+    }, 401);
+  }
+
+  let autenticado = false;
+
+  try {
+    autenticado = await validarAssinatura(
+      corpo,
+      assinatura,
+      env.PAGBANK_TOKEN
     );
+  } catch (erro) {
+    return responder({
+      erro: 'Falha na verificacao da assinatura'
+    }, 503);
+  }
+
+  if (!autenticado) {
+    return responder({
+      erro: 'Assinatura invalida'
+    }, 401);
   }
 
   let evento;
 
   try {
     evento = JSON.parse(corpo);
-  } catch {
-    return responder({ erro: 'JSON inválido' }, 400);
+  } catch (erro) {
+    return responder({
+      erro: 'JSON invalido'
+    }, 400);
+  }
+
+  if (
+    !evento ||
+    typeof evento !== 'object' ||
+    Array.isArray(evento)
+  ) {
+    return responder({
+      erro: 'Evento invalido'
+    }, 400);
   }
 
   const status = evento.status || null;
 
-  const estados = [
-    'PAID',
-    'AUTHORIZED',
-    'WAITING',
-    'IN_ANALYSIS',
-    'DECLINED',
-    'CANCELED',
-    'EXPIRED'
-  ];
-
-  if (status && !estados.includes(status)) {
-    return responder({
-      recebido: true,
-      processado: false,
-      motivo: 'Status não tratado'
-    });
-  }
-
-  // Nesta etapa, somente confirmamos que o evento
-  // passou pela validação de autenticidade.
+  // A notificacao foi autenticada.
+  // Ainda nao registra pedidos pagos.
+  // Ainda nao altera estoque.
   //
-  // Na próxima etapa, adicionaremos:
-  // - banco de dados D1;
-  // - identificação do pedido;
-  // - prevenção de processamento duplicado;
-  // - confirmação do valor;
-  // - atualização segura do estoque.
+  // Proximas etapas:
+  // 1. Criar banco Cloudflare D1.
+  // 2. Registrar os pedidos.
+  // 3. Conferir valores e status dos pagamentos.
+  // 4. Evitar processamento duplicado.
+  // 5. Atualizar estoque com seguranca.
 
   return responder({
     recebido: true,
     autenticado: true,
-    status,
     processado: false,
-    mensagem: 'Aguardando integração com banco de dados'
+    status: status,
+    mensagem: 'Notificacao recebida para testes'
   });
 }
 
 export function onRequestGet() {
-  return responder(
-    { erro: 'Método não permitido' },
-    405
-  );
+  return responder({
+    erro: 'Metodo nao permitido'
+  }, 405);
 }
-```

@@ -3,10 +3,11 @@
  * URBAN KICKS - CONFIRMAR PAGAMENTO
  * PagBank Sandbox + Cloudflare D1
  *
- * Confirma pagamento diretamente no PagBank.
- * Valida checkout, ordem, cobranca e valor.
- * Atualiza pedido e estoque atomicamente.
- * Impede processamento duplicado.
+ * Confirma pagamento consultando diretamente o PagBank.
+ * Atualiza pedido, registra cobranca e desconta estoque
+ * em uma unica transacao atomica D1.
+ *
+ * Acesso administrativo via CONSULTA_ADMIN_KEY.
  */
 
 const API = 'https://sandbox.api.pagseguro.com';
@@ -25,7 +26,6 @@ function compararSeguro(a, b) {
   if (
     typeof a !== 'string' ||
     typeof b !== 'string' ||
-    !a ||
     a.length !== b.length
   ) {
     return false;
@@ -151,12 +151,12 @@ export async function onRequestPost({ request, env }) {
   try {
     checkout = await consultarPagBank(
       '/checkouts/' +
-      encodeURIComponent(pedido.checkout_id),
+        encodeURIComponent(pedido.checkout_id),
       env.PAGBANK_TOKEN
     );
   } catch {
     return responder({
-      erro: 'Falha ao consultar checkout'
+      erro: 'Falha ao consultar checkout PagBank'
     }, 502);
   }
 
@@ -173,12 +173,19 @@ export async function onRequestPost({ request, env }) {
     ? checkout.orders
     : [];
 
-  const pagamentos = [];
-  let ordemNaoVerificada = false;
+  if (ordens.length === 0) {
+    return responder({
+      erro: 'Checkout sem ordens'
+    }, 409);
+  }
+
+  const cobrancasPagas = [];
 
   for (const resumo of ordens) {
     if (
-      !/^ORDE_[A-Z0-9-]+$/i.test(resumo?.id || '')
+      !/^ORDE_[A-Z0-9-]+$/i.test(
+        resumo?.id || ''
+      )
     ) {
       return responder({
         erro: 'Identificador de ordem invalido'
@@ -189,7 +196,8 @@ export async function onRequestPost({ request, env }) {
 
     try {
       ordem = await consultarPagBank(
-        '/orders/' + encodeURIComponent(resumo.id),
+        '/orders/' +
+          encodeURIComponent(resumo.id),
         env.PAGBANK_TOKEN
       );
     } catch {
@@ -200,13 +208,8 @@ export async function onRequestPost({ request, env }) {
 
     if (ordem.id !== resumo.id) {
       return responder({
-        erro: 'Identificador da ordem nao confere'
+        erro: 'Identificador da ordem divergente'
       }, 409);
-    }
-
-    if (ordem.reference_id !== pedido.referencia) {
-      ordemNaoVerificada = true;
-      continue;
     }
 
     const cobrancas = Array.isArray(ordem.charges)
@@ -218,48 +221,48 @@ export async function onRequestPost({ request, env }) {
         continue;
       }
 
-      if (
-        !/^CHAR_[A-Z0-9-]+$/i.test(cobranca.id || '') ||
-        !Number.isSafeInteger(cobranca.amount?.value) ||
-        cobranca.amount.value <= 0 ||
-        cobranca.amount.currency !== 'BRL'
-      ) {
-        return responder({
-          erro: 'Cobranca paga com dados invalidos'
-        }, 409);
-      }
-
-      pagamentos.push({
+      cobrancasPagas.push({
         ordemId: ordem.id,
+        referenciaOrdem: ordem.reference_id,
         cobrancaId: cobranca.id,
-        valor: cobranca.amount.value
+        valor: cobranca.amount?.value,
+        moeda: cobranca.amount?.currency
       });
     }
   }
 
-  if (ordemNaoVerificada) {
-    return responder({
-      erro: 'Existem ordens sem vinculo confirmado',
-      pagamentoConfirmado: false
-    }, 409);
-  }
-
-  if (pagamentos.length !== 1) {
+  if (cobrancasPagas.length === 0) {
     return responder({
       pedidoId,
+      status: 'PENDENTE',
       pagamentoConfirmado: false,
       estoqueAlterado: false,
-      quantidadePagamentos: pagamentos.length,
-      mensagem: 'Pagamento requer verificacao'
+      mensagem: 'Pagamento ainda nao confirmado'
     }, 409);
   }
 
-  const pagamento = pagamentos[0];
-
-  if (pagamento.valor !== pedido.valor_total) {
+  if (cobrancasPagas.length !== 1) {
     return responder({
-      erro: 'Valor pago diferente do pedido',
-      pagamentoConfirmado: false
+      erro: 'Multiplas cobrancas pagas',
+      mensagem: 'Revisao manual necessaria'
+    }, 409);
+  }
+
+  const pagamento = cobrancasPagas[0];
+
+  if (
+    pagamento.referenciaOrdem !==
+      pedido.referencia ||
+    !/^CHAR_[A-Z0-9-]+$/i.test(
+      pagamento.cobrancaId || ''
+    ) ||
+    !Number.isSafeInteger(pagamento.valor) ||
+    pagamento.valor !== pedido.valor_total ||
+    (pagamento.moeda &&
+      pagamento.moeda !== 'BRL')
+  ) {
+    return responder({
+      erro: 'Dados do pagamento nao conferem'
     }, 409);
   }
 
@@ -271,7 +274,9 @@ export async function onRequestPost({ request, env }) {
         produto_id,
         tamanho,
         SUM(quantidade) AS quantidade,
-        SUM(quantidade * preco_unitario) AS subtotal
+        SUM(
+          quantidade * preco_unitario
+        ) AS subtotal
       FROM pedido_itens
       WHERE pedido_id = ?
       GROUP BY produto_id, tamanho
@@ -305,41 +310,47 @@ export async function onRequestPost({ request, env }) {
 
   if (totalItens !== pedido.valor_total) {
     return responder({
-      erro: 'Total dos itens nao confere'
+      erro: 'Valor dos itens divergente'
     }, 409);
   }
 
   /*
-   * Protecao transacional:
+   * Transacao atomica:
    *
-   * SQLite RAISE(ABORT) nao pode ser usado
-   * diretamente em um SELECT comum.
+   * 1. Atualiza o pedido somente se PENDENTE.
+   * 2. Registra a cobranca com UNIQUE.
+   * 3. Desconta o estoque.
    *
-   * Usamos um gatilho temporario de validacao
-   * atraves de uma tabela permanente de controle.
+   * Se houver concorrencia, estoque insuficiente,
+   * cobranca duplicada ou registro inexistente,
+   * uma restricao SQL provoca rollback do batch.
    *
-   * Para evitar depender de gatilhos adicionais,
-   * a operacao utiliza INSERT condicional com
-   * restricoes UNIQUE e CHECK.
-   *
-   * Uma falha SQL cancela todo o DB.batch().
+   * O INSERT no estoque usa quantidade negativa
+   * intencionalmente: se o registro nao existir,
+   * o CHECK(quantidade >= 0) impede sua criacao.
    */
 
-  const comandos = [];
+  const comandos = [
+    env.DB.prepare(`
+      UPDATE pedidos
+      SET
+        status = CASE
+          WHEN status = 'PENDENTE'
+          THEN 'PAGO'
+          ELSE NULL
+        END,
+        atualizado_em = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(pedidoId),
 
-  /*
-   * Primeiro, reservar a confirmacao.
-   *
-   * A tabela pagamentos_processados deve possuir:
-   * - pedido_id UNIQUE
-   * - cobranca_pagbank UNIQUE
-   */
-
-  comandos.push(
     env.DB.prepare(`
       INSERT INTO pagamentos_processados
-        (pedido_id, ordem_pagbank,
-         cobranca_pagbank, valor)
+      (
+        pedido_id,
+        ordem_pagbank,
+        cobranca_pagbank,
+        valor
+      )
       VALUES (?, ?, ?, ?)
     `).bind(
       pedidoId,
@@ -347,92 +358,47 @@ export async function onRequestPost({ request, env }) {
       pagamento.cobrancaId,
       pagamento.valor
     )
-  );
-
-  /*
-   * Cada desconto usa uma instrucao que falha
-   * se nao houver estoque suficiente.
-   *
-   * A insercao em estoque com quantidade -1
-   * provoca conflito com CHECK (quantidade >= 0)
-   * caso a atualizacao nao encontre estoque.
-   *
-   * A falha reverte o batch inteiro.
-   */
+  ];
 
   for (const item of itens) {
     comandos.push(
       env.DB.prepare(`
         INSERT INTO estoque
-          (produto_id, tamanho, quantidade)
-        VALUES (?, ?, -1)
+        (
+          produto_id,
+          tamanho,
+          quantidade
+        )
+        VALUES (?, ?, ?)
         ON CONFLICT(produto_id, tamanho)
         DO UPDATE SET
-          quantidade = CASE
-            WHEN estoque.quantidade >= ?
-            THEN estoque.quantidade - ?
-            ELSE -1
-          END,
+          quantidade =
+            estoque.quantidade + excluded.quantidade,
           atualizado_em = CURRENT_TIMESTAMP
       `).bind(
         item.produto_id,
         item.tamanho,
-        item.quantidade,
-        item.quantidade
+        -item.quantidade
       )
     );
   }
 
-  /*
-   * Confirma o pedido somente se ainda estiver
-   * pendente.
-   *
-   * O INSERT abaixo usa a tabela de pagamentos
-   * como trava de unicidade.
-   */
-
-  comandos.push(
-    env.DB.prepare(`
-      UPDATE pedidos
-      SET status = 'PAGO',
-          atualizado_em = CURRENT_TIMESTAMP
-      WHERE id = ?
-        AND status = 'PENDENTE'
-    `).bind(pedidoId)
-  );
-
   try {
-    const resultados = await env.DB.batch(comandos);
-
-    const alteracoes = resultados.map(
-      resultado => resultado.meta?.changes ?? 0
-    );
-
-    if (alteracoes.some(n => n !== 1)) {
-      console.error('Alteracoes inesperadas', {
-        pedidoId,
-        alteracoes
-      });
-
-      return responder({
-        erro: 'Verificacao de consistencia necessaria',
-        pedidoId
-      }, 503);
-    }
+    await env.DB.batch(comandos);
   } catch (erro) {
-    console.error('Erro na transacao', {
+    console.error('CONFIRMACAO FALHOU', {
       pedidoId,
-      mensagem: erro instanceof Error
+      erro: erro instanceof Error
         ? erro.message
         : 'Erro desconhecido'
     });
 
     return responder({
-      erro: 'Confirmacao nao concluida',
+      erro: 'Nao foi possivel confirmar o pedido',
       pedidoId,
-      pagamentoConfirmado: false,
-      mensagem: 'Verifique o banco antes de repetir'
-    }, 503);
+      mensagem:
+        'Nenhuma alteracao parcial deve ser aplicada. Consulte o D1 antes de repetir.'
+    }, 409);
   }
 
   return responder({
@@ -445,7 +411,8 @@ export async function onRequestPost({ request, env }) {
     ordemId: pagamento.ordemId,
     cobrancaId: pagamento.cobrancaId,
     valorPago: pagamento.valor,
-    mensagem: 'Pagamento confirmado e estoque atualizado'
+    mensagem:
+      'Pagamento confirmado e estoque atualizado'
   });
 }
 

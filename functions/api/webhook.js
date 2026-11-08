@@ -2,11 +2,12 @@
 /*
  * URBAN KICKS - WEBHOOK PAGBANK SANDBOX
  *
- * Etapa: autenticacao e identificacao de pedidos.
+ * Etapa: autenticacao e diagnostico.
  *
  * - Valida assinatura SHA-256 antiga.
  * - Detecta assinaturas do formato novo.
  * - Consulta pedidos no Cloudflare D1.
+ * - Registra diagnosticos seguros nos logs.
  * - Nao aprova pagamentos automaticamente.
  * - Nao altera estoque nesta etapa.
  */
@@ -150,13 +151,24 @@ async function buscarPedido(db, identificacao) {
 }
 
 export async function onRequestPost({ request, env }) {
+
   if (!env.PAGBANK_TOKEN) {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'configuracao',
+      tokenConfigurado: false
+    });
+
     return responder({
       erro: 'Token PagBank nao configurado'
     }, 503);
   }
 
   if (!env.DB) {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'configuracao',
+      bancoConfigurado: false
+    });
+
     return responder({
       erro: 'Banco D1 nao configurado'
     }, 503);
@@ -182,7 +194,10 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
-  if (!corpo || corpo.length > LIMITE_CORPO) {
+  if (
+    !corpo ||
+    new TextEncoder().encode(corpo).length > LIMITE_CORPO
+  ) {
     return responder({
       erro: 'Corpo invalido'
     }, 400);
@@ -196,26 +211,82 @@ export async function onRequestPost({ request, env }) {
     'x-authenticity-token'
   );
 
+  const origemProduto = request.headers.get(
+    'x-product-origin'
+  );
+
+  const identificadorProduto = request.headers.get(
+    'x-product-id'
+  );
+
+  // Diagnostico seguro: registra somente presenca
+  // de cabecalhos, nunca seus valores secretos.
+
+  console.log('WEBHOOK DIAGNOSTICO', {
+    etapa: 'recebimento',
+    metodo: request.method,
+    assinaturaAntigaPresente: Boolean(
+      assinaturaAntiga
+    ),
+    assinaturaNovaPresente: Boolean(
+      assinaturaNova
+    ),
+    origemProdutoPresente: Boolean(
+      origemProduto
+    ),
+    identificadorProdutoPresente: Boolean(
+      identificadorProduto
+    ),
+    corpoRecebido: Boolean(corpo)
+  });
+
   /*
-   * O formato novo usa assinatura ECDSA.
-   * Nao podemos validá-lo com o SHA-256 antigo.
-   * Retornamos 503 ate implementar a verificacao
-   * com a chave publica oficial do PagBank.
+   * Assinatura nova:
+   * Nao e validada pelo metodo SHA-256 antigo.
    */
+
   if (assinaturaNova) {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'autenticacao',
+      resultado: 'formato_novo_nao_suportado'
+    });
+
     return responder({
       erro: 'Assinatura ECDSA requer validacao',
       processado: false
     }, 503);
   }
 
+  /*
+   * Assinatura antiga ausente.
+   */
+
   if (!assinaturaAntiga) {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'autenticacao',
+      resultado: 'assinatura_ausente',
+      assinaturaAntigaPresente: false,
+      assinaturaNovaPresente: Boolean(
+        assinaturaNova
+      ),
+      origemProdutoPresente: Boolean(
+        origemProduto
+      ),
+      identificadorProdutoPresente: Boolean(
+        identificadorProduto
+      )
+    });
+
     return responder({
       erro: 'Assinatura ausente'
     }, 401);
   }
 
-  let autenticado;
+  /*
+   * Validacao da assinatura SHA-256 antiga.
+   */
+
+  let autenticado = false;
 
   try {
     autenticado = await validarAssinaturaAntiga(
@@ -224,16 +295,35 @@ export async function onRequestPost({ request, env }) {
       env.PAGBANK_TOKEN
     );
   } catch {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'autenticacao',
+      resultado: 'erro_validacao'
+    });
+
     return responder({
       erro: 'Falha na validacao da assinatura'
     }, 503);
   }
 
   if (!autenticado) {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'autenticacao',
+      resultado: 'assinatura_invalida'
+    });
+
     return responder({
       erro: 'Assinatura invalida'
     }, 401);
   }
+
+  console.log('WEBHOOK DIAGNOSTICO', {
+    etapa: 'autenticacao',
+    resultado: 'assinatura_valida'
+  });
+
+  /*
+   * Leitura do evento autenticado.
+   */
 
   let evento;
 
@@ -255,6 +345,10 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
+  /*
+   * Identificacao do pedido.
+   */
+
   const identificacao = identificarPedido(
     evento,
     request
@@ -268,6 +362,11 @@ export async function onRequestPost({ request, env }) {
       identificacao
     );
   } catch {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'banco',
+      resultado: 'erro_consulta'
+    });
+
     return responder({
       erro: 'Falha ao consultar pedido no D1'
     }, 503);
@@ -279,6 +378,11 @@ export async function onRequestPost({ request, env }) {
       : null;
 
   if (!pedido) {
+    console.log('WEBHOOK DIAGNOSTICO', {
+      etapa: 'pedido',
+      resultado: 'nao_encontrado'
+    });
+
     return responder({
       recebido: true,
       autenticado: true,
@@ -289,20 +393,26 @@ export async function onRequestPost({ request, env }) {
     });
   }
 
+  console.log('WEBHOOK DIAGNOSTICO', {
+    etapa: 'pedido',
+    resultado: 'encontrado',
+    pedidoId: pedido.id,
+    statusAtual: pedido.status
+  });
+
   /*
-   * IMPORTANTE:
+   * SEGURANCA:
    *
-   * O status recebido ainda nao e suficiente
-   * para confirmar o pagamento.
+   * O webhook ainda nao confirma pagamentos.
    *
-   * A proxima etapa devera:
+   * Proximas etapas:
    *
-   * 1. Consultar o pagamento na API PagBank.
-   * 2. Vincular a transacao ao checkout correto.
-   * 3. Conferir o valor pago.
-   * 4. Confirmar o status PAID.
-   * 5. Atualizar pedido e estoque em transacao
-   *    idempotente no banco D1.
+   * 1. Consultar pagamento na API PagBank.
+   * 2. Conferir checkout e referencia.
+   * 3. Conferir valor pago.
+   * 4. Confirmar status PAID.
+   * 5. Atualizar pedido e estoque com
+   *    protecao contra processamento duplicado.
    */
 
   return responder({
@@ -315,7 +425,8 @@ export async function onRequestPost({ request, env }) {
     statusRecebido,
     processado: false,
     estoqueAlterado: false,
-    mensagem: 'Pedido identificado. Pagamento ainda nao confirmado.'
+    mensagem:
+      'Pedido identificado. Pagamento ainda nao confirmado.'
   });
 }
 

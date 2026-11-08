@@ -1,6 +1,7 @@
-
- // Cloudflare Pages Function — PagBank Sandbox
- // Preços em centavos, validados no servidor.
+```javascript
+// Urban Kicks — Cloudflare Pages Function
+// PagBank Sandbox (ambiente de testes)
+// Preços em centavos, validados no servidor.
 
 const PRODUTOS = {
   1: { nome: 'New Balance — Cinza Urbano', valor: 39990 },
@@ -13,6 +14,9 @@ const PRODUTOS = {
   8: { nome: 'Nike P-6000 — Branco Lateral', valor: 37990 }
 };
 
+const SITE_URL = 'https://urban-kicks.pages.dev';
+const PAGBANK_API = 'https://sandbox.api.pagseguro.com/checkouts';
+
 const responder = (dados, status = 200) =>
   new Response(JSON.stringify(dados), {
     status,
@@ -24,7 +28,10 @@ const responder = (dados, status = 200) =>
 
 export async function onRequestPost({ request, env }) {
   if (!env.PAGBANK_TOKEN) {
-    return responder({ erro: 'Token PagBank não configurado' }, 503);
+    return responder(
+      { erro: 'Token PagBank não configurado' },
+      503
+    );
   }
 
   let pedido;
@@ -97,26 +104,33 @@ export async function onRequestPost({ request, env }) {
   const referencia = `UK-${crypto.randomUUID()}`;
 
   try {
-    const resposta = await fetch(
-      'https://sandbox.api.pagseguro.com/checkouts',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${env.PAGBANK_TOKEN}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json'
-        },
-        body: JSON.stringify({
-          reference_id: referencia,
-          items: itens,
-          payment_methods: [
-            { type: 'PIX' },
-            { type: 'CREDIT_CARD' }
-          ],
-          return_url: 'https://urban-kicks.pages.dev/'
-        })
-      }
-    );
+    const resposta = await fetch(PAGBANK_API, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.PAGBANK_TOKEN}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      body: JSON.stringify({
+        reference_id: referencia,
+        items: itens,
+
+        payment_methods: [
+          { type: 'PIX' },
+          { type: 'CREDIT_CARD' }
+        ],
+
+        return_url: `${SITE_URL}/`,
+
+        payment_notification_urls: [
+          `${SITE_URL}/api/webhook`
+        ],
+
+        notification_urls: [
+          `${SITE_URL}/api/webhook`
+        ]
+      })
+    });
 
     const dados = await resposta.json().catch(() => ({}));
 
@@ -124,12 +138,15 @@ export async function onRequestPost({ request, env }) {
       return responder({
         erro: 'PagBank recusou a criação do checkout',
         statusPagBank: resposta.status,
-        detalhes: dados.error_messages || dados.message || null
+        detalhes:
+          dados.error_messages ||
+          dados.message ||
+          null
       }, 502);
     }
 
     const link = dados.links?.find(
-      x => x.rel === 'PAY'
+      item => item.rel === 'PAY'
     )?.href;
 
     if (
@@ -156,3 +173,4 @@ export async function onRequestPost({ request, env }) {
     );
   }
 }
+```

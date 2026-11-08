@@ -1,13 +1,21 @@
 
-// Urban Kicks - Webhook PagBank Sandbox
-// Recebe notificacoes e verifica a autenticidade.
-// Nao confirma pedidos nem altera estoque nesta etapa.
+/*
+ * URBAN KICKS - WEBHOOK PAGBANK SANDBOX
+ *
+ * Etapa: autenticacao e identificacao de pedidos.
+ *
+ * - Valida assinatura SHA-256 antiga.
+ * - Detecta assinaturas do formato novo.
+ * - Consulta pedidos no Cloudflare D1.
+ * - Nao aprova pagamentos automaticamente.
+ * - Nao altera estoque nesta etapa.
+ */
 
-const API = 'https://sandbox.api.pagseguro.com';
+const LIMITE_CORPO = 200000;
 
 function responder(dados, status = 200) {
   return new Response(JSON.stringify(dados), {
-    status: status,
+    status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store'
@@ -15,11 +23,9 @@ function responder(dados, status = 200) {
   });
 }
 
-function hex(buffer) {
+function converterHex(buffer) {
   return Array.from(new Uint8Array(buffer))
-    .map(function (byte) {
-      return byte.toString(16).padStart(2, '0');
-    })
+    .map(byte => byte.toString(16).padStart(2, '0'))
     .join('');
 }
 
@@ -41,11 +47,12 @@ function compararSeguro(a, b) {
   return diferenca === 0;
 }
 
-async function validarAssinatura(corpo, assinatura, token) {
-  if (
-    typeof assinatura !== 'string' ||
-    !/^[a-f0-9]{64}$/i.test(assinatura)
-  ) {
+async function validarAssinaturaAntiga(
+  corpo,
+  assinatura,
+  token
+) {
+  if (!/^[a-f0-9]{64}$/i.test(assinatura || '')) {
     return false;
   }
 
@@ -57,9 +64,89 @@ async function validarAssinatura(corpo, assinatura, token) {
   );
 
   return compararSeguro(
-    hex(digest),
+    converterHex(digest),
     assinatura.toLowerCase()
   );
+}
+
+function identificarPedido(evento, request) {
+  const referencia =
+    typeof evento.reference_id === 'string'
+      ? evento.reference_id
+      : null;
+
+  const checkoutEvento =
+    typeof evento.checkout_id === 'string'
+      ? evento.checkout_id
+      : null;
+
+  const origem = request.headers.get(
+    'x-product-origin'
+  );
+
+  const produtoId = request.headers.get(
+    'x-product-id'
+  );
+
+  const checkoutHeader =
+    origem === 'CHECKOUT' &&
+    produtoId?.startsWith('CHEC_')
+      ? produtoId
+      : null;
+
+  return {
+    referencia,
+    checkoutId: checkoutEvento || checkoutHeader
+  };
+}
+
+async function buscarPedido(db, identificacao) {
+  const { referencia, checkoutId } = identificacao;
+
+  if (referencia && checkoutId) {
+    return await db.prepare(`
+      SELECT
+        id,
+        referencia,
+        checkout_id,
+        status,
+        valor_total
+      FROM pedidos
+      WHERE referencia = ?
+        AND checkout_id = ?
+      LIMIT 1
+    `).bind(referencia, checkoutId).first();
+  }
+
+  if (referencia) {
+    return await db.prepare(`
+      SELECT
+        id,
+        referencia,
+        checkout_id,
+        status,
+        valor_total
+      FROM pedidos
+      WHERE referencia = ?
+      LIMIT 1
+    `).bind(referencia).first();
+  }
+
+  if (checkoutId) {
+    return await db.prepare(`
+      SELECT
+        id,
+        referencia,
+        checkout_id,
+        status,
+        valor_total
+      FROM pedidos
+      WHERE checkout_id = ?
+      LIMIT 1
+    `).bind(checkoutId).first();
+  }
+
+  return null;
 }
 
 export async function onRequestPost({ request, env }) {
@@ -69,13 +156,17 @@ export async function onRequestPost({ request, env }) {
     }, 503);
   }
 
-  const tamanhoMaximo = 200000;
+  if (!env.DB) {
+    return responder({
+      erro: 'Banco D1 nao configurado'
+    }, 503);
+  }
 
   const tamanhoInformado = Number(
-    request.headers.get('content-length')
+    request.headers.get('content-length') || 0
   );
 
-  if (tamanhoInformado > tamanhoMaximo) {
+  if (tamanhoInformado > LIMITE_CORPO) {
     return responder({
       erro: 'Notificacao muito grande'
     }, 413);
@@ -85,39 +176,56 @@ export async function onRequestPost({ request, env }) {
 
   try {
     corpo = await request.text();
-  } catch (erro) {
+  } catch {
     return responder({
-      erro: 'Nao foi possivel ler a notificacao'
+      erro: 'Falha ao ler notificacao'
     }, 400);
   }
 
-  if (!corpo || corpo.length > tamanhoMaximo) {
+  if (!corpo || corpo.length > LIMITE_CORPO) {
     return responder({
-      erro: 'Corpo da notificacao invalido'
+      erro: 'Corpo invalido'
     }, 400);
   }
 
-  const assinatura = request.headers.get(
+  const assinaturaNova = request.headers.get(
+    'x-payload-signature'
+  );
+
+  const assinaturaAntiga = request.headers.get(
     'x-authenticity-token'
   );
 
-  if (!assinatura) {
+  /*
+   * O formato novo usa assinatura ECDSA.
+   * Nao podemos validá-lo com o SHA-256 antigo.
+   * Retornamos 503 ate implementar a verificacao
+   * com a chave publica oficial do PagBank.
+   */
+  if (assinaturaNova) {
+    return responder({
+      erro: 'Assinatura ECDSA requer validacao',
+      processado: false
+    }, 503);
+  }
+
+  if (!assinaturaAntiga) {
     return responder({
       erro: 'Assinatura ausente'
     }, 401);
   }
 
-  let autenticado = false;
+  let autenticado;
 
   try {
-    autenticado = await validarAssinatura(
+    autenticado = await validarAssinaturaAntiga(
       corpo,
-      assinatura,
+      assinaturaAntiga,
       env.PAGBANK_TOKEN
     );
-  } catch (erro) {
+  } catch {
     return responder({
-      erro: 'Falha na verificacao da assinatura'
+      erro: 'Falha na validacao da assinatura'
     }, 503);
   }
 
@@ -131,7 +239,7 @@ export async function onRequestPost({ request, env }) {
 
   try {
     evento = JSON.parse(corpo);
-  } catch (erro) {
+  } catch {
     return responder({
       erro: 'JSON invalido'
     }, 400);
@@ -147,25 +255,67 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
-  const status = evento.status || null;
+  const identificacao = identificarPedido(
+    evento,
+    request
+  );
 
-  // A notificacao foi autenticada.
-  // Ainda nao registra pedidos pagos.
-  // Ainda nao altera estoque.
-  //
-  // Proximas etapas:
-  // 1. Criar banco Cloudflare D1.
-  // 2. Registrar os pedidos.
-  // 3. Conferir valores e status dos pagamentos.
-  // 4. Evitar processamento duplicado.
-  // 5. Atualizar estoque com seguranca.
+  let pedido;
+
+  try {
+    pedido = await buscarPedido(
+      env.DB,
+      identificacao
+    );
+  } catch {
+    return responder({
+      erro: 'Falha ao consultar pedido no D1'
+    }, 503);
+  }
+
+  const statusRecebido =
+    typeof evento.status === 'string'
+      ? evento.status
+      : null;
+
+  if (!pedido) {
+    return responder({
+      recebido: true,
+      autenticado: true,
+      pedidoEncontrado: false,
+      processado: false,
+      statusRecebido,
+      mensagem: 'Pedido nao identificado'
+    });
+  }
+
+  /*
+   * IMPORTANTE:
+   *
+   * O status recebido ainda nao e suficiente
+   * para confirmar o pagamento.
+   *
+   * A proxima etapa devera:
+   *
+   * 1. Consultar o pagamento na API PagBank.
+   * 2. Vincular a transacao ao checkout correto.
+   * 3. Conferir o valor pago.
+   * 4. Confirmar o status PAID.
+   * 5. Atualizar pedido e estoque em transacao
+   *    idempotente no banco D1.
+   */
 
   return responder({
     recebido: true,
     autenticado: true,
+    pedidoEncontrado: true,
+    pedidoId: pedido.id,
+    referencia: pedido.referencia,
+    statusAtual: pedido.status,
+    statusRecebido,
     processado: false,
-    status: status,
-    mensagem: 'Notificacao recebida para testes'
+    estoqueAlterado: false,
+    mensagem: 'Pedido identificado. Pagamento ainda nao confirmado.'
   });
 }
 

@@ -1,31 +1,28 @@
 
 /*
- * URBAN KICKS
- * WEBHOOK PAGBANK SANDBOX
+ * URBAN KICKS - WEBHOOK PAGBANK SANDBOX
  *
- * Cloudflare Pages Functions + D1
+ * Recebe notificacoes autenticadas do PagBank.
+ * Identifica pedidos por referencia, checkout
+ * ou identificador de ordem.
  *
- * Integra a notificacao autenticada com:
- * functions/api/confirmar-pagamento.js
+ * Reutiliza confirmar-pagamento.js.
  *
- * - Valida assinatura SHA-256 antiga
- * - Nao aceita notificacoes sem assinatura valida
- * - Nao confia apenas no status recebido
- * - Consulta novamente o PagBank pela funcao
- *   de confirmacao existente
- * - Funciona para todos os produtos e tamanhos
- * - Nao autoriza multiplas cobrancas automaticamente
- * - Nao desconta estoque diretamente
- * - Nao usa Hoppscotch para confirmar pagamentos
+ * Funciona com todos os produtos cadastrados
+ * e numeracoes de 34 a 44.
  *
- * IMPORTANTE:
- * Assinaturas ECDSA novas ainda nao sao suportadas.
+ * Nao autoriza multiplas cobrancas automaticamente.
+ * Nao altera estoque diretamente.
+ *
+ * Assinatura SHA-256 antiga: suportada.
+ * Assinatura ECDSA nova: bloqueada ate validacao.
  */
 
 import {
   onRequestPost as confirmarPagamento
 } from "./confirmar-pagamento.js";
 
+const API = "https://sandbox.api.pagseguro.com";
 const LIMITE_CORPO = 200000;
 
 function responder(dados, status = 200) {
@@ -56,17 +53,7 @@ function compararSeguro(a, b) {
   return diferenca === 0;
 }
 
-function converterHex(buffer) {
-  return Array.from(new Uint8Array(buffer))
-    .map(byte => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function validarAssinaturaAntiga(
-  corpo,
-  assinatura,
-  token
-) {
+async function validarAssinatura(corpo, assinatura, token) {
   if (!/^[a-f0-9]{64}$/i.test(assinatura || "")) {
     return false;
   }
@@ -78,22 +65,66 @@ async function validarAssinaturaAntiga(
     new TextEncoder().encode(mensagem)
   );
 
+  const hexadecimal = Array.from(
+    new Uint8Array(digest)
+  ).map(
+    byte => byte.toString(16).padStart(2, "0")
+  ).join("");
+
   return compararSeguro(
-    converterHex(digest),
+    hexadecimal,
     assinatura.toLowerCase()
   );
 }
 
-function identificarPedido(evento, request) {
+function idValido(valor, prefixo) {
+  return (
+    typeof valor === "string" &&
+    new RegExp(
+      "^" + prefixo + "_[A-F0-9-]{36}$",
+      "i"
+    ).test(valor)
+  );
+}
+
+async function consultarPagBank(caminho, token) {
+  const resposta = await fetch(API + caminho, {
+    method: "GET",
+    headers: {
+      Authorization: "Bearer " + token,
+      Accept: "application/json"
+    },
+    signal: AbortSignal.timeout(12000)
+  });
+
+  if (!resposta.ok) {
+    throw new Error(
+      "Consulta PagBank HTTP " + resposta.status
+    );
+  }
+
+  return resposta.json();
+}
+
+function identificarEvento(evento, request) {
   const referencia =
     typeof evento.reference_id === "string"
       ? evento.reference_id
       : null;
 
-  const checkoutEvento =
-    typeof evento.checkout_id === "string"
+  const checkoutId =
+    idValido(evento.checkout_id, "CHEC")
       ? evento.checkout_id
       : null;
+
+  const ordemId =
+    idValido(evento.id, "ORDE")
+      ? evento.id
+      : idValido(evento.order_id, "ORDE")
+        ? evento.order_id
+        : idValido(evento.metadata?.ps_order_id, "ORDE")
+          ? evento.metadata.ps_order_id
+          : null;
 
   const origem = request.headers.get(
     "x-product-origin"
@@ -105,21 +136,74 @@ function identificarPedido(evento, request) {
 
   const checkoutHeader =
     origem === "CHECKOUT" &&
-    /^CHEC_[A-F0-9-]{36}$/i.test(produtoId || "")
+    idValido(produtoId, "CHEC")
+      ? produtoId
+      : null;
+
+  const ordemHeader =
+    origem === "ORDER" &&
+    idValido(produtoId, "ORDE")
       ? produtoId
       : null;
 
   return {
     referencia,
-    checkoutId: checkoutEvento || checkoutHeader
+    checkoutId: checkoutId || checkoutHeader,
+    ordemId: ordemId || ordemHeader
   };
 }
 
-async function buscarPedido(DB, identificacao) {
-  const { referencia, checkoutId } = identificacao;
+async function localizarPedido(DB, identificacao, token) {
+  let {
+    referencia,
+    checkoutId,
+    ordemId
+  } = identificacao;
+
+  /*
+   * Quando o evento identifica uma ordem,
+   * consultar o PagBank para obter sua
+   * referencia oficial.
+   *
+   * Nao confiar somente nos campos enviados
+   * pela notificacao.
+   */
+
+  if (ordemId) {
+    const ordem = await consultarPagBank(
+      "/orders/" + encodeURIComponent(ordemId),
+      token
+    );
+
+    if (
+      ordem.id !== ordemId ||
+      typeof ordem.reference_id !== "string"
+    ) {
+      throw new Error(
+        "Ordem PagBank sem referencia valida"
+      );
+    }
+
+    if (
+      referencia &&
+      referencia !== ordem.reference_id
+    ) {
+      throw new Error(
+        "Referencia do evento divergente"
+      );
+    }
+
+    referencia = ordem.reference_id;
+  }
+
+  if (!referencia && !checkoutId) {
+    return null;
+  }
+
+  let pedido;
 
   if (referencia && checkoutId) {
-    return DB.prepare(`
+    pedido = await DB.prepare(`
       SELECT
         id,
         referencia,
@@ -131,10 +215,9 @@ async function buscarPedido(DB, identificacao) {
         AND checkout_id = ?
       LIMIT 1
     `).bind(referencia, checkoutId).first();
-  }
 
-  if (referencia) {
-    return DB.prepare(`
+  } else if (referencia) {
+    pedido = await DB.prepare(`
       SELECT
         id,
         referencia,
@@ -145,10 +228,9 @@ async function buscarPedido(DB, identificacao) {
       WHERE referencia = ?
       LIMIT 1
     `).bind(referencia).first();
-  }
 
-  if (checkoutId) {
-    return DB.prepare(`
+  } else {
+    pedido = await DB.prepare(`
       SELECT
         id,
         referencia,
@@ -161,13 +243,72 @@ async function buscarPedido(DB, identificacao) {
     `).bind(checkoutId).first();
   }
 
-  return null;
+  if (!pedido) {
+    return null;
+  }
+
+  /*
+   * Se uma ordem foi informada, conferir
+   * se realmente pertence ao checkout local.
+   */
+
+  if (ordemId) {
+    const checkout = await consultarPagBank(
+      "/checkouts/" +
+      encodeURIComponent(pedido.checkout_id),
+      token
+    );
+
+    if (
+      checkout.id !== pedido.checkout_id ||
+      checkout.reference_id !== pedido.referencia ||
+      !Array.isArray(checkout.orders) ||
+      !checkout.orders.some(o => o.id === ordemId)
+    ) {
+      throw new Error(
+        "Ordem nao pertence ao checkout local"
+      );
+    }
+  }
+
+  return pedido;
 }
 
-export async function onRequestPost({
-  request,
-  env
-}) {
+async function executarConfirmacao(pedidoId, env, url) {
+  /*
+   * Reutiliza a funcao administrativa existente.
+   * Nao autoriza pagamentos duplicados.
+   */
+
+  const requisicao = new Request(
+    new URL("/api/confirmar-pagamento", url),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-admin-key": env.CONSULTA_ADMIN_KEY
+      },
+      body: JSON.stringify({
+        pedidoId,
+        autorizarConfirmacao: false
+      })
+    }
+  );
+
+  const resposta = await confirmarPagamento({
+    request: requisicao,
+    env
+  });
+
+  const dados = await resposta.json();
+
+  return {
+    statusHTTP: resposta.status,
+    dados
+  };
+}
+
+export async function onRequestPost({ request, env }) {
   if (
     !env.DB ||
     !env.PAGBANK_TOKEN ||
@@ -178,13 +319,13 @@ export async function onRequestPost({
     }, 503);
   }
 
-  const tamanhoInformado = Number(
+  const tamanho = Number(
     request.headers.get("content-length") || 0
   );
 
   if (
-    !Number.isFinite(tamanhoInformado) ||
-    tamanhoInformado > LIMITE_CORPO
+    !Number.isFinite(tamanho) ||
+    tamanho > LIMITE_CORPO
   ) {
     return responder({
       erro: "Notificacao muito grande"
@@ -219,24 +360,27 @@ export async function onRequestPost({
   );
 
   /*
-   * Nunca processar uma notificacao sem
-   * assinatura antiga validada.
-   *
-   * O formato novo exige verificacao ECDSA
-   * e nao pode ser tratado como SHA-256 antigo.
+   * ECDSA ainda nao suportada.
+   * Nao processar sem validar assinatura.
    */
 
-  if (!assinaturaAntiga) {
-    if (assinaturaNova) {
-      console.warn(
-        "WEBHOOK: assinatura ECDSA nao suportada"
-      );
+  if (assinaturaNova) {
+    console.warn("WEBHOOK", {
+      etapa: "autenticacao",
+      resultado: "ECDSA_NAO_SUPORTADA"
+    });
 
-      return responder({
-        erro: "Formato de assinatura nao suportado",
-        processado: false
-      }, 503);
-    }
+    return responder({
+      erro: "Assinatura ECDSA nao suportada",
+      processado: false
+    }, 503);
+  }
+
+  if (!assinaturaAntiga) {
+    console.warn("WEBHOOK", {
+      etapa: "autenticacao",
+      resultado: "ASSINATURA_AUSENTE"
+    });
 
     return responder({
       erro: "Assinatura ausente",
@@ -244,21 +388,26 @@ export async function onRequestPost({
     }, 401);
   }
 
-  let autenticado = false;
+  let autenticado;
 
   try {
-    autenticado = await validarAssinaturaAntiga(
+    autenticado = await validarAssinatura(
       corpo,
       assinaturaAntiga,
       env.PAGBANK_TOKEN
     );
   } catch {
     return responder({
-      erro: "Falha na validacao da assinatura"
+      erro: "Falha ao validar assinatura"
     }, 503);
   }
 
   if (!autenticado) {
+    console.warn("WEBHOOK", {
+      etapa: "autenticacao",
+      resultado: "ASSINATURA_INVALIDA"
+    });
+
     return responder({
       erro: "Assinatura invalida",
       processado: false
@@ -285,53 +434,41 @@ export async function onRequestPost({
     }, 400);
   }
 
-  /*
-   * Identificar o pedido no D1.
-   *
-   * A notificacao nao determina se o
-   * pagamento foi aprovado.
-   *
-   * A verificacao sera feita diretamente
-   * na API do PagBank pela funcao existente.
-   */
-
-  const identificacao = identificarPedido(
+  const identificacao = identificarEvento(
     evento,
     request
   );
 
-  if (
-    !identificacao.referencia &&
-    !identificacao.checkoutId
-  ) {
-    console.warn(
-      "WEBHOOK: notificacao sem identificador de pedido"
-    );
-
-    return responder({
-      recebido: true,
-      autenticado: true,
-      pedidoEncontrado: false,
-      processado: false,
-      mensagem: "Identificador do pedido ausente"
-    }, 422);
-  }
+  console.log("WEBHOOK", {
+    etapa: "evento_autenticado",
+    possuiReferencia: Boolean(
+      identificacao.referencia
+    ),
+    possuiCheckout: Boolean(
+      identificacao.checkoutId
+    ),
+    possuiOrdem: Boolean(
+      identificacao.ordemId
+    )
+  });
 
   let pedido;
 
   try {
-    pedido = await buscarPedido(
+    pedido = await localizarPedido(
       env.DB,
-      identificacao
+      identificacao,
+      env.PAGBANK_TOKEN
     );
   } catch (erro) {
     console.error(
-      "WEBHOOK: falha ao consultar D1",
+      "WEBHOOK LOCALIZACAO",
       erro instanceof Error ? erro.message : erro
     );
 
     return responder({
-      erro: "Falha ao consultar pedido"
+      erro: "Falha ao validar pedido",
+      processado: false
     }, 503);
   }
 
@@ -341,25 +478,22 @@ export async function onRequestPost({
       autenticado: true,
       pedidoEncontrado: false,
       processado: false,
-      mensagem: "Pedido nao encontrado"
-    }, 404);
+      mensagem: "Pedido nao identificado"
+    }, 422);
   }
 
   /*
-   * Pedido ja confirmado.
-   * Nao descontar estoque novamente.
+   * Evita processar pedidos ja pagos.
    */
 
   if (pedido.status === "PAGO") {
     return responder({
       recebido: true,
       autenticado: true,
-      pedidoEncontrado: true,
       pedidoId: pedido.id,
       status: "PAGO",
       jaProcessado: true,
-      estoqueAlterado: false,
-      mensagem: "Pedido ja confirmado"
+      estoqueAlterado: false
     });
   }
 
@@ -369,105 +503,56 @@ export async function onRequestPost({
       autenticado: true,
       pedidoId: pedido.id,
       status: pedido.status,
-      processado: false,
-      mensagem: "Pedido requer verificacao administrativa"
-    }, 409);
-  }
-
-  /*
-   * Chamar diretamente a funcao de
-   * confirmacao que ja funciona.
-   *
-   * Nao fazemos uma requisicao HTTP externa.
-   * Nao expomos a chave administrativa.
-   *
-   * autorizarConfirmacao permanece FALSE.
-   * Assim, multiplas cobrancas nao sao
-   * confirmadas automaticamente.
-   */
-
-  let respostaConfirmacao;
-
-  try {
-    const requisicaoInterna = new Request(
-      new URL(
-        "/api/confirmar-pagamento",
-        request.url
-      ).toString(),
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-admin-key": env.CONSULTA_ADMIN_KEY
-        },
-        body: JSON.stringify({
-          pedidoId: pedido.id,
-          autorizarConfirmacao: false
-        })
-      }
-    );
-
-    respostaConfirmacao = await confirmarPagamento({
-      request: requisicaoInterna,
-      env
-    });
-  } catch (erro) {
-    console.error(
-      "WEBHOOK: falha na confirmacao",
-      erro instanceof Error ? erro.message : erro
-    );
-
-    return responder({
-      erro: "Falha interna ao confirmar pagamento",
-      pedidoId: pedido.id,
       processado: false
-    }, 503);
+    }, 409);
   }
 
   let resultado;
 
   try {
-    resultado = await respostaConfirmacao.json();
-  } catch {
+    resultado = await executarConfirmacao(
+      pedido.id,
+      env,
+      request.url
+    );
+  } catch (erro) {
+    console.error(
+      "WEBHOOK CONFIRMACAO",
+      erro instanceof Error ? erro.message : erro
+    );
+
     return responder({
-      erro: "Resposta de confirmacao invalida",
+      erro: "Falha ao executar confirmacao",
       pedidoId: pedido.id
     }, 503);
   }
 
-  /*
-   * Confirmacao realizada com sucesso.
-   */
+  const dados = resultado.dados;
 
   if (
-    respostaConfirmacao.ok &&
-    resultado.pagamentoConfirmado === true
+    resultado.statusHTTP === 200 &&
+    dados.pagamentoConfirmado === true
   ) {
-    console.log("WEBHOOK PAGAMENTO CONFIRMADO", {
-      pedidoId: pedido.id,
-      status: "PAGO"
+    console.log("WEBHOOK", {
+      etapa: "pagamento_confirmado",
+      pedidoId: pedido.id
     });
 
     return responder({
       recebido: true,
       autenticado: true,
-      pedidoEncontrado: true,
       pedidoId: pedido.id,
       status: "PAGO",
       pagamentoConfirmado: true,
-      estoqueAlterado: resultado.estoqueAlterado === true,
-      mensagem: "Pagamento confirmado automaticamente"
+      estoqueAlterado: true,
+      mensagem:
+        "Pagamento confirmado automaticamente"
     });
   }
 
-  /*
-   * Pedido confirmado por outra requisicao
-   * enquanto este webhook era processado.
-   */
-
   if (
-    respostaConfirmacao.ok &&
-    resultado.jaProcessado === true
+    resultado.statusHTTP === 200 &&
+    dados.jaProcessado === true
   ) {
     return responder({
       recebido: true,
@@ -479,19 +564,14 @@ export async function onRequestPost({
     });
   }
 
-  /*
-   * Multiplas cobrancas:
-   * auditoria registrada, sem baixa de estoque.
-   */
-
   if (
-    resultado.revisaoManual === true &&
-    resultado.auditoriaRegistrada === true
+    dados.revisaoManual === true &&
+    dados.auditoriaRegistrada === true
   ) {
-    console.warn("WEBHOOK REVISAO MANUAL", {
+    console.warn("WEBHOOK", {
+      etapa: "revisao_manual",
       pedidoId: pedido.id,
-      quantidadeCobrancas:
-        resultado.quantidadeCobrancas
+      quantidadeCobrancas: dados.quantidadeCobrancas
     });
 
     return responder({
@@ -504,19 +584,13 @@ export async function onRequestPost({
       pagamentoConfirmado: false,
       estoqueAlterado: false,
       mensagem:
-        "Multiplas cobrancas. Revisao administrativa necessaria."
+        "Multiplas cobrancas. Revisao necessaria."
     });
   }
 
-  /*
-   * Nenhuma cobranca paga encontrada.
-   * A notificacao foi autenticada, mas
-   * o pedido continua pendente.
-   */
-
   if (
-    resultado.pagamentoConfirmado === false &&
-    resultado.mensagem === "Nenhuma cobranca paga"
+    dados.pagamentoConfirmado === false &&
+    dados.mensagem === "Nenhuma cobranca paga"
   ) {
     return responder({
       recebido: true,
@@ -524,27 +598,20 @@ export async function onRequestPost({
       pedidoId: pedido.id,
       status: "PENDENTE",
       pagamentoConfirmado: false,
-      estoqueAlterado: false,
-      mensagem: "Pagamento ainda nao confirmado"
+      estoqueAlterado: false
     });
   }
 
-  /*
-   * Outros erros devem ser investigados.
-   * Nao afirmar que o pedido foi pago.
-   */
-
-  console.error("WEBHOOK CONCILIACAO INCONCLUSA", {
+  console.error("WEBHOOK", {
+    etapa: "conciliacao_inconclusa",
     pedidoId: pedido.id,
-    statusConfirmacao: respostaConfirmacao.status,
-    erro: resultado.erro || "Desconhecido"
+    statusHTTP: resultado.statusHTTP
   });
 
   return responder({
     erro: "Conciliacao inconclusa",
     pedidoId: pedido.id,
-    pagamentoConfirmado: false,
-    estoqueAlterado: false
+    processado: false
   }, 503);
 }
 

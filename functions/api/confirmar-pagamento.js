@@ -1,47 +1,24 @@
 
 /*
  * URBAN KICKS
- * Confirmacao de pagamento
+ * PagBank Sandbox + Cloudflare D1
  *
- * PagBank Sandbox
- * Cloudflare Pages Functions
- * Cloudflare D1
+ * Funciona para todos os 8 produtos
+ * e tamanhos de 34 a 44.
  *
  * POST /api/confirmar-pagamento
+ * Header: x-admin-key
  *
- * Header:
- * x-admin-key: SUA_CHAVE_ADMINISTRATIVA
+ * Consulta normal:
+ * {"pedidoId":2}
  *
- * Body:
- * {
- *   "pedidoId": 2
- * }
- *
- * Recursos:
- * - Autenticacao administrativa
- * - Consulta direta ao PagBank
- * - Validacao de checkout
- * - Consulta de todas as ordens
- * - Identificacao de cobrancas pagas
- * - Registro de cobrancas adicionais
- * - Confirmacao unica do pedido
- * - Desconto atomico de estoque
- * - Protecao contra processamento repetido
- * - Rollback em erros SQL
- *
- * IMPORTANTE:
- * Cobrancas adicionais sao registradas
- * para revisao manual.
- * Este codigo nao realiza estornos.
+ * Confirmacao apos revisao:
+ * {"pedidoId":2,"autorizarConfirmacao":true}
  */
 
 const API = "https://sandbox.api.pagseguro.com";
 
-// ==================================================
-// RESPOSTAS JSON
-// ==================================================
-
-function responder(dados, status = 200) {
+function json(dados, status = 200) {
   return new Response(JSON.stringify(dados), {
     status,
     headers: {
@@ -51,52 +28,22 @@ function responder(dados, status = 200) {
   });
 }
 
-// ==================================================
-// COMPARACAO DE CHAVE ADMINISTRATIVA
-// ==================================================
-
-function compararSeguro(a, b) {
+function chaveIgual(a, b) {
   if (
     typeof a !== "string" ||
     typeof b !== "string" ||
     a.length !== b.length
-  ) {
-    return false;
-  }
+  ) return false;
 
   let diferenca = 0;
-
   for (let i = 0; i < a.length; i++) {
     diferenca |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
-
   return diferenca === 0;
 }
 
-// ==================================================
-// VALIDAR IDENTIFICADORES PAGBANK
-// ==================================================
-
-function identificadorValido(valor, prefixo) {
-  if (typeof valor !== "string") {
-    return false;
-  }
-
-  const expressao = new RegExp(
-    "^" + prefixo + "_[A-Z0-9-]+$",
-    "i"
-  );
-
-  return expressao.test(valor);
-}
-
-// ==================================================
-// CONSULTAR API PAGBANK
-// ==================================================
-
-async function consultarPagBank(caminho, token) {
+async function pagbank(caminho, token) {
   const resposta = await fetch(API + caminho, {
-    method: "GET",
     headers: {
       Authorization: "Bearer " + token,
       Accept: "application/json"
@@ -105,694 +52,478 @@ async function consultarPagBank(caminho, token) {
   });
 
   if (!resposta.ok) {
-    throw new Error(
-      "PagBank retornou HTTP " + resposta.status
-    );
+    throw new Error("PagBank HTTP " + resposta.status);
   }
 
   return resposta.json();
 }
 
-// ==================================================
-// CONSULTAR PEDIDO LOCAL
-// ==================================================
-
-async function buscarPedido(DB, pedidoId) {
-  return DB.prepare(`
-    SELECT
-      id,
-      referencia,
-      checkout_id,
-      status,
-      valor_total
-    FROM pedidos
-    WHERE id = ?
-    LIMIT 1
-  `).bind(pedidoId).first();
-}
-
-// ==================================================
-// CONSULTAR ITENS DO PEDIDO
-// ==================================================
-
-async function buscarItens(DB, pedidoId) {
-  const resultado = await DB.prepare(`
-    SELECT
-      produto_id,
-      tamanho,
-      SUM(quantidade) AS quantidade,
-      SUM(
-        quantidade * preco_unitario
-      ) AS subtotal
-    FROM pedido_itens
-    WHERE pedido_id = ?
-    GROUP BY produto_id, tamanho
-  `).bind(pedidoId).all();
-
-  return resultado.results || [];
-}
-
-// ==================================================
-// VALIDAR ITENS E VALOR TOTAL
-// ==================================================
-
-function validarItens(itens, valorTotal) {
-  if (
-    !Array.isArray(itens) ||
-    itens.length === 0
-  ) {
-    return false;
-  }
-
-  let total = 0;
-
-  for (const item of itens) {
-    if (
-      !Number.isSafeInteger(item.produto_id) ||
-      !Number.isSafeInteger(item.quantidade) ||
-      item.quantidade < 1 ||
-      !Number.isSafeInteger(item.subtotal) ||
-      item.subtotal < 1 ||
-      typeof item.tamanho !== "string" ||
-      !item.tamanho.trim()
-    ) {
-      return false;
-    }
-
-    total += item.subtotal;
-
-    if (!Number.isSafeInteger(total)) {
-      return false;
-    }
-  }
-
-  return total === valorTotal;
-}
-
-// ==================================================
-// CONSULTAR TODAS AS COBRANCAS PAGAS
-// ==================================================
-
-async function consultarCobrancas(
-  checkout,
-  pedido,
-  token
-) {
-  const ordens = Array.isArray(checkout.orders)
-    ? checkout.orders
-    : [];
-
-  if (ordens.length === 0) {
+async function buscarCobrancas(checkout, pedido, token) {
+  if (!Array.isArray(checkout.orders) ||
+      checkout.orders.length === 0) {
     throw new Error("Checkout sem ordens");
   }
 
   const ordensVistas = new Set();
-  const cobrancasVistas = new Set();
+  const idsVistos = new Set();
   const pagas = [];
 
-  for (const resumo of ordens) {
+  for (const resumo of checkout.orders) {
     const ordemId = resumo?.id;
 
     if (
-      !identificadorValido(ordemId, "ORDE") ||
+      typeof ordemId !== "string" ||
+      !/^ORDE_[A-F0-9-]{36}$/i.test(ordemId) ||
       ordensVistas.has(ordemId)
     ) {
-      throw new Error(
-        "Identificador de ordem invalido ou repetido"
-      );
+      throw new Error("Ordem invalida ou repetida");
     }
 
     ordensVistas.add(ordemId);
 
-    const ordem = await consultarPagBank(
+    const ordem = await pagbank(
       "/orders/" + encodeURIComponent(ordemId),
       token
     );
 
-    if (ordem.id !== ordemId) {
-      throw new Error(
-        "Identificador da ordem divergente"
-      );
-    }
-
     if (
+      ordem.id !== ordemId ||
       ordem.reference_id !== pedido.referencia
     ) {
-      throw new Error(
-        "Referencia da ordem divergente"
-      );
+      throw new Error("Ordem nao corresponde ao pedido");
     }
 
-    const cobrancas = Array.isArray(ordem.charges)
-      ? ordem.charges
-      : [];
-
-    for (const cobranca of cobrancas) {
-      if (cobranca.status !== "PAID") {
-        continue;
-      }
-
-      const id = cobranca.id;
-      const valor = cobranca.amount?.value;
-      const moeda = cobranca.amount?.currency;
+    for (const c of ordem.charges || []) {
+      if (c.status !== "PAID") continue;
 
       if (
-        !identificadorValido(id, "CHAR") ||
-        cobrancasVistas.has(id)
+        typeof c.id !== "string" ||
+        !/^CHAR_[A-F0-9-]{36}$/i.test(c.id) ||
+        idsVistos.has(c.id)
       ) {
-        throw new Error(
-          "Cobranca invalida ou repetida"
-        );
+        throw new Error("Cobranca invalida ou repetida");
       }
 
       if (
-        !Number.isSafeInteger(valor) ||
-        valor !== pedido.valor_total ||
-        (moeda && moeda !== "BRL")
+        c.amount?.value !== pedido.valor_total ||
+        (c.amount?.currency &&
+         c.amount.currency !== "BRL")
       ) {
-        throw new Error(
-          "Valor ou moeda divergente"
-        );
+        throw new Error("Valor ou moeda divergente");
       }
 
-      cobrancasVistas.add(id);
+      idsVistos.add(c.id);
 
       pagas.push({
         ordemId,
-        cobrancaId: id,
-        valor,
-        metodo:
-          cobranca.payment_method?.type || null,
-        pagoEm:
-          cobranca.paid_at || null
+        cobrancaId: c.id,
+        valor: c.amount.value,
+        metodo: c.payment_method?.type || null,
+        pagoEm: c.paid_at || null
       });
     }
   }
 
   pagas.sort((a, b) => {
-    const dataA = Date.parse(a.pagoEm || "");
-    const dataB = Date.parse(b.pagoEm || "");
-
-    const tempoA = Number.isFinite(dataA)
-      ? dataA
-      : Number.MAX_SAFE_INTEGER;
-
-    const tempoB = Number.isFinite(dataB)
-      ? dataB
-      : Number.MAX_SAFE_INTEGER;
+    const ta = Date.parse(a.pagoEm || "");
+    const tb = Date.parse(b.pagoEm || "");
 
     return (
-      tempoA - tempoB ||
-      a.cobrancaId.localeCompare(b.cobrancaId)
-    );
+      (Number.isFinite(ta) ? ta : Infinity) -
+      (Number.isFinite(tb) ? tb : Infinity)
+    ) || a.cobrancaId.localeCompare(b.cobrancaId);
   });
 
   return pagas;
 }
 
-// ==================================================
-// PREPARAR TRANSACAO ATOMICA D1
-// ==================================================
+async function buscarItens(DB, pedidoId, valorTotal) {
+  const resultado = await DB.prepare(`
+    SELECT
+      produto_id,
+      CAST(tamanho AS TEXT) AS tamanho,
+      SUM(quantidade) AS quantidade,
+      SUM(quantidade * preco_unitario) AS subtotal
+    FROM pedido_itens
+    WHERE pedido_id = ?
+    GROUP BY produto_id, CAST(tamanho AS TEXT)
+  `).bind(pedidoId).all();
 
-function prepararTransacao(
-  DB,
-  pedido,
-  itens,
-  cobrancasPagas
-) {
-  const principal = cobrancasPagas[0];
+  const itens = resultado.results || [];
+
+  if (!itens.length) {
+    throw new Error("Pedido sem itens");
+  }
+
+  let total = 0;
+
+  for (const item of itens) {
+    const tamanho = Number(item.tamanho);
+
+    if (
+      !Number.isSafeInteger(item.produto_id) ||
+      item.produto_id < 1 ||
+      !Number.isSafeInteger(tamanho) ||
+      tamanho < 34 ||
+      tamanho > 44 ||
+      !Number.isSafeInteger(item.quantidade) ||
+      item.quantidade < 1 ||
+      !Number.isSafeInteger(item.subtotal) ||
+      item.subtotal < 1
+    ) {
+      throw new Error("Item ou tamanho invalido");
+    }
+
+    total += item.subtotal;
+  }
+
+  if (total !== valorTotal) {
+    throw new Error("Total dos itens divergente");
+  }
+
+  return itens;
+}
+
+async function registrarAuditoria(DB, pedidoId, cobrancas) {
+  const principal = cobrancas[0];
   const comandos = [];
 
-  // ----------------------------------------------
-  // 1. CONFIRMAR PEDIDO UMA UNICA VEZ
-  // ----------------------------------------------
-  //
-  // Se status nao for PENDENTE, atribuir NULL
-  // provoca erro devido ao NOT NULL.
-  //
-  // Isso impede confirmacao concorrente.
+  for (const c of cobrancas) {
+    const conciliacao =
+      c.cobrancaId === principal.cobrancaId
+        ? "PRINCIPAL"
+        : "REVISAO_MANUAL";
 
-  comandos.push(
-    DB.prepare(`
-      UPDATE pedidos
-      SET
-        status = CASE
-          WHEN status = 'PENDENTE'
-          THEN 'PAGO'
-          ELSE NULL
-        END,
-        atualizado_em = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(pedido.id)
-  );
-
-  // ----------------------------------------------
-  // 2. REGISTRAR PAGAMENTO PRINCIPAL
-  // ----------------------------------------------
-  //
-  // A tabela possui UNIQUE em pedido_id
-  // e cobranca_pagbank.
-  //
-  // Uma segunda tentativa provoca erro SQL.
-
-  comandos.push(
-    DB.prepare(`
-      INSERT INTO pagamentos_processados (
+    comandos.push(DB.prepare(`
+      INSERT INTO cobrancas_pagbank (
         pedido_id,
         ordem_pagbank,
         cobranca_pagbank,
-        valor
+        valor,
+        status,
+        metodo,
+        conciliacao
       )
-      VALUES (?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 'PAID', ?, ?)
+      ON CONFLICT(cobranca_pagbank) DO NOTHING
     `).bind(
-      pedido.id,
-      principal.ordemId,
-      principal.cobrancaId,
-      principal.valor
+      pedidoId,
+      c.ordemId,
+      c.cobrancaId,
+      c.valor,
+      c.metodo,
+      conciliacao
+    ));
+  }
+
+  await DB.batch(comandos);
+
+  // Confere se todos os registros realmente
+  // pertencem ao pedido e correspondem ao PagBank.
+  const encontrados = await DB.prepare(`
+    SELECT
+      ordem_pagbank,
+      cobranca_pagbank,
+      valor,
+      status,
+      conciliacao
+    FROM cobrancas_pagbank
+    WHERE pedido_id = ?
+  `).bind(pedidoId).all();
+
+  const mapa = new Map(
+    (encontrados.results || []).map(
+      c => [c.cobranca_pagbank, c]
     )
   );
 
-  // ----------------------------------------------
-  // 3. REGISTRAR TODAS AS COBRANCAS PAGAS
-  // ----------------------------------------------
-  //
-  // A primeira sera PRINCIPAL.
-  // As demais ficam como DUPLICADA.
-  //
-  // DUPLICADA significa cobranca adicional
-  // identificada para revisao.
-  //
-  // Nao significa pagamento estornado.
+  for (const c of cobrancas) {
+    const salvo = mapa.get(c.cobrancaId);
 
-  for (const cobranca of cobrancasPagas) {
-    const conciliacao =
-      cobranca.cobrancaId === principal.cobrancaId
-        ? "PRINCIPAL"
-        : "DUPLICADA";
-
-    comandos.push(
-      DB.prepare(`
-        INSERT INTO cobrancas_pagbank (
-          pedido_id,
-          ordem_pagbank,
-          cobranca_pagbank,
-          valor,
-          status,
-          metodo,
-          conciliacao
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        pedido.id,
-        cobranca.ordemId,
-        cobranca.cobrancaId,
-        cobranca.valor,
-        "PAID",
-        cobranca.metodo,
-        conciliacao
-      )
-    );
+    if (
+      !salvo ||
+      salvo.ordem_pagbank !== c.ordemId ||
+      salvo.valor !== c.valor ||
+      salvo.status !== "PAID"
+    ) {
+      throw new Error("Auditoria inconsistente");
+    }
   }
 
-  // ----------------------------------------------
-  // 4. DESCONTAR ESTOQUE
-  // ----------------------------------------------
-  //
-  // A coluna quantidade e NOT NULL.
-  //
-  // Se quantidade disponivel for insuficiente,
-  // o UPDATE tenta gravar NULL.
-  //
-  // Isso gera erro SQL e rollback.
-  //
-  // Se o estoque nao existir, o INSERT
-  // de verificacao gera erro SQL.
-  //
-  // Todas as instrucoes fazem parte do batch.
-
-  for (const item of itens) {
-    comandos.push(
-      DB.prepare(`
-        UPDATE estoque
-        SET
-          quantidade = CASE
-            WHEN quantidade >= ?
-            THEN quantidade - ?
-            ELSE NULL
-          END,
-          atualizado_em = CURRENT_TIMESTAMP
-        WHERE produto_id = ?
-          AND tamanho = ?
-      `).bind(
-        item.quantidade,
-        item.quantidade,
-        item.produto_id,
-        item.tamanho
-      )
-    );
-
-    // Verificar existencia do registro.
-    // Se nao existir, INSERT com NULL
-    // viola restricoes NOT NULL.
-
-    comandos.push(
-      DB.prepare(`
-        INSERT INTO estoque (
-          produto_id,
-          tamanho,
-          quantidade
-        )
-        SELECT
-          NULL,
-          NULL,
-          NULL
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM estoque
-          WHERE produto_id = ?
-            AND tamanho = ?
-        )
-      `).bind(
-        item.produto_id,
-        item.tamanho
-      )
-    );
-  }
-
-  return {
-    comandos,
-    principal
-  };
+  return mapa;
 }
 
-// ==================================================
-// ENDPOINT POST
-// ==================================================
+function prepararConfirmacao(DB, pedido, itens, principal) {
+  const comandos = [];
 
-export async function onRequestPost({
-  request,
-  env
-}) {
-  // ----------------------------------------------
-  // 1. VERIFICAR CONFIGURACAO
-  // ----------------------------------------------
+  // Uma segunda confirmacao causa erro SQL,
+  // fazendo rollback do batch inteiro.
+  comandos.push(DB.prepare(`
+    UPDATE pedidos
+    SET
+      status = CASE
+        WHEN status = 'PENDENTE' THEN 'PAGO'
+        ELSE NULL
+      END,
+      atualizado_em = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(pedido.id));
 
+  // UNIQUE(pedido_id) impede novo processamento.
+  comandos.push(DB.prepare(`
+    INSERT INTO pagamentos_processados (
+      pedido_id,
+      ordem_pagbank,
+      cobranca_pagbank,
+      valor
+    )
+    VALUES (?, ?, ?, ?)
+  `).bind(
+    pedido.id,
+    principal.ordemId,
+    principal.cobrancaId,
+    principal.valor
+  ));
+
+  // Cada produto e tamanho recebe seu
+  // proprio desconto de estoque.
+  for (const item of itens) {
+    comandos.push(DB.prepare(`
+      UPDATE estoque
+      SET
+        quantidade = CASE
+          WHEN quantidade >= ?
+          THEN quantidade - ?
+          ELSE NULL
+        END,
+        atualizado_em = CURRENT_TIMESTAMP
+      WHERE produto_id = ?
+        AND CAST(tamanho AS TEXT) = ?
+    `).bind(
+      item.quantidade,
+      item.quantidade,
+      item.produto_id,
+      item.tamanho
+    ));
+
+    // Se a linha de estoque nao existir,
+    // provoca erro SQL e rollback.
+    comandos.push(DB.prepare(`
+      INSERT INTO estoque (
+        produto_id,
+        tamanho,
+        quantidade
+      )
+      SELECT NULL, NULL, NULL
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM estoque
+        WHERE produto_id = ?
+          AND CAST(tamanho AS TEXT) = ?
+      )
+    `).bind(
+      item.produto_id,
+      item.tamanho
+    ));
+  }
+
+  return comandos;
+}
+
+export async function onRequestPost({ request, env }) {
   if (
     !env.DB ||
     !env.PAGBANK_TOKEN ||
     !env.CONSULTA_ADMIN_KEY
   ) {
-    return responder({
-      erro: "Configuracao incompleta"
-    }, 503);
+    return json({ erro: "Configuracao incompleta" }, 503);
   }
 
-  // ----------------------------------------------
-  // 2. AUTENTICACAO ADMINISTRATIVA
-  // ----------------------------------------------
-
-  const chave = request.headers.get(
-    "x-admin-key"
-  );
-
-  if (
-    !compararSeguro(
-      chave,
-      env.CONSULTA_ADMIN_KEY
-    )
-  ) {
-    return responder({
-      erro: "Nao autorizado"
-    }, 401);
+  if (!chaveIgual(
+    request.headers.get("x-admin-key"),
+    env.CONSULTA_ADMIN_KEY
+  )) {
+    return json({ erro: "Nao autorizado" }, 401);
   }
-
-  // ----------------------------------------------
-  // 3. LER JSON
-  // ----------------------------------------------
 
   let entrada;
-
   try {
     entrada = await request.json();
   } catch {
-    return responder({
-      erro: "JSON invalido"
-    }, 400);
+    return json({ erro: "JSON invalido" }, 400);
   }
 
   const pedidoId = entrada?.pedidoId;
+  const autorizar = entrada?.autorizarConfirmacao === true;
 
-  if (
-    !Number.isSafeInteger(pedidoId) ||
-    pedidoId < 1
-  ) {
-    return responder({
-      erro: "Pedido invalido"
-    }, 400);
+  if (!Number.isSafeInteger(pedidoId) || pedidoId < 1) {
+    return json({ erro: "Pedido invalido" }, 400);
   }
-
-  // ----------------------------------------------
-  // 4. CONSULTAR PEDIDO LOCAL
-  // ----------------------------------------------
-
-  let pedido;
 
   try {
-    pedido = await buscarPedido(
-      env.DB,
-      pedidoId
-    );
-  } catch (erro) {
-    console.error(
-      "FALHA CONSULTA PEDIDO",
-      erro
-    );
+    const pedido = await env.DB.prepare(`
+      SELECT id, referencia, checkout_id,
+             status, valor_total
+      FROM pedidos
+      WHERE id = ?
+    `).bind(pedidoId).first();
 
-    return responder({
-      erro: "Falha ao consultar pedido"
-    }, 503);
-  }
+    if (!pedido) {
+      return json({ erro: "Pedido nao encontrado" }, 404);
+    }
 
-  if (!pedido) {
-    return responder({
-      erro: "Pedido nao encontrado"
-    }, 404);
-  }
+    if (pedido.status === "PAGO") {
+      return json({
+        pedidoId,
+        status: "PAGO",
+        jaProcessado: true,
+        estoqueAlterado: false,
+        mensagem: "Pedido ja confirmado anteriormente"
+      });
+    }
 
-  // ----------------------------------------------
-  // 5. PROTECAO CONTRA REPETICAO
-  // ----------------------------------------------
+    if (pedido.status !== "PENDENTE") {
+      return json({
+        erro: "Status nao permite confirmacao",
+        status: pedido.status
+      }, 409);
+    }
 
-  if (pedido.status === "PAGO") {
-    return responder({
-      ambiente: "SANDBOX",
-      pedidoId,
-      status: "PAGO",
-      jaProcessado: true,
-      estoqueAlterado: false,
-      mensagem: "Pedido ja confirmado"
-    });
-  }
+    if (
+      !/^CHEC_[A-F0-9-]{36}$/i.test(pedido.checkout_id || "") ||
+      typeof pedido.referencia !== "string" ||
+      !Number.isSafeInteger(pedido.valor_total) ||
+      pedido.valor_total <= 0
+    ) {
+      return json({ erro: "Dados locais invalidos" }, 409);
+    }
 
-  if (pedido.status !== "PENDENTE") {
-    return responder({
-      erro: "Status nao permite confirmacao"
-    }, 409);
-  }
-
-  // ----------------------------------------------
-  // 6. VALIDAR DADOS LOCAIS
-  // ----------------------------------------------
-
-  if (
-    !identificadorValido(
-      pedido.checkout_id,
-      "CHEC"
-    ) ||
-    typeof pedido.referencia !== "string" ||
-    !pedido.referencia.trim() ||
-    !Number.isSafeInteger(pedido.valor_total) ||
-    pedido.valor_total <= 0
-  ) {
-    return responder({
-      erro: "Dados locais invalidos"
-    }, 409);
-  }
-
-  // ----------------------------------------------
-  // 7. CONSULTAR CHECKOUT PAGBANK
-  // ----------------------------------------------
-
-  let checkout;
-
-  try {
-    checkout = await consultarPagBank(
-      "/checkouts/" +
-        encodeURIComponent(pedido.checkout_id),
+    const checkout = await pagbank(
+      "/checkouts/" + encodeURIComponent(pedido.checkout_id),
       env.PAGBANK_TOKEN
     );
-  } catch (erro) {
-    console.error(
-      "FALHA CHECKOUT PAGBANK",
-      erro
-    );
 
-    return responder({
-      erro: "Falha ao consultar checkout PagBank"
-    }, 502);
-  }
+    if (
+      checkout.id !== pedido.checkout_id ||
+      checkout.reference_id !== pedido.referencia
+    ) {
+      return json({
+        erro: "Checkout divergente"
+      }, 409);
+    }
 
-  if (
-    checkout.id !== pedido.checkout_id ||
-    checkout.reference_id !== pedido.referencia
-  ) {
-    return responder({
-      erro: "Checkout nao corresponde ao pedido"
-    }, 409);
-  }
-
-  // ----------------------------------------------
-  // 8. CONSULTAR ORDENS E COBRANCAS
-  // ----------------------------------------------
-
-  let cobrancasPagas;
-
-  try {
-    cobrancasPagas = await consultarCobrancas(
+    const cobrancas = await buscarCobrancas(
       checkout,
       pedido,
       env.PAGBANK_TOKEN
     );
-  } catch (erro) {
-    console.error(
-      "FALHA CONCILIACAO PAGBANK",
-      erro
+
+    if (!cobrancas.length) {
+      return json({
+        pedidoId,
+        status: "PENDENTE",
+        pagamentoConfirmado: false,
+        estoqueAlterado: false,
+        mensagem: "Nenhuma cobranca paga"
+      }, 409);
+    }
+
+    const itens = await buscarItens(
+      env.DB,
+      pedidoId,
+      pedido.valor_total
     );
 
-    return responder({
-      erro: "Falha ao validar cobrancas",
-      mensagem: "Revisao manual necessaria"
-    }, 409);
-  }
+    // Registra todas as cobrancas para auditoria.
+    const auditoria = await registrarAuditoria(
+      env.DB,
+      pedidoId,
+      cobrancas
+    );
 
-  // ----------------------------------------------
-  // 9. VERIFICAR PAGAMENTO
-  // ----------------------------------------------
+    const multiplas = cobrancas.length > 1;
 
-  if (cobrancasPagas.length === 0) {
-    return responder({
+    // Com multiplas cobrancas, a primeira
+    // chamada nao confirma o pedido.
+    if (multiplas && !autorizar) {
+      return json({
+        ambiente: "SANDBOX",
+        pedidoId,
+        status: "PENDENTE",
+        revisaoManual: true,
+        quantidadeCobrancas: cobrancas.length,
+        cobrancasAdicionais: cobrancas.length - 1,
+        auditoriaRegistrada: true,
+        pagamentoConfirmado: false,
+        estoqueAlterado: false,
+        mensagem:
+          "Multiplas cobrancas registradas. " +
+          "Confirmacao administrativa necessaria."
+      }, 409);
+    }
+
+    // Exige que todas as cobrancas estejam
+    // registradas antes de autorizar.
+    if (multiplas && autorizar) {
+      for (const c of cobrancas) {
+        if (!auditoria.has(c.cobrancaId)) {
+          return json({
+            erro: "Auditoria incompleta"
+          }, 409);
+        }
+      }
+    }
+
+    const principal = cobrancas[0];
+
+    const comandos = prepararConfirmacao(
+      env.DB,
+      pedido,
+      itens,
+      principal
+    );
+
+    // D1.batch executa as instrucoes
+    // como transacao: falha SQL causa rollback.
+    await env.DB.batch(comandos);
+
+    return json({
       ambiente: "SANDBOX",
       pedidoId,
-      status: "PENDENTE",
-      pagamentoConfirmado: false,
-      estoqueAlterado: false,
-      mensagem: "Nenhuma cobranca paga"
-    }, 409);
-  }
+      referencia: pedido.referencia,
+      status: "PAGO",
+      pagamentoConfirmado: true,
+      estoqueAlterado: true,
+      quantidadeCobrancas: cobrancas.length,
+      cobrancasAdicionais: cobrancas.length - 1,
+      revisaoNecessaria: multiplas,
+      produtosAtualizados: itens.map(i => ({
+        produtoId: i.produto_id,
+        tamanho: i.tamanho,
+        quantidadeDescontada: i.quantidade
+      })),
+      mensagem:
+        "Pedido confirmado uma unica vez. " +
+        "Estoque atualizado por produto e tamanho."
+    });
 
-  // ----------------------------------------------
-  // 10. CONSULTAR ITENS
-  // ----------------------------------------------
-
-  let itens;
-
-  try {
-    itens = await buscarItens(
-      env.DB,
-      pedidoId
-    );
   } catch (erro) {
     console.error(
-      "FALHA CONSULTA ITENS",
-      erro
+      "ERRO CONFIRMACAO PAGAMENTO",
+      erro instanceof Error ? erro.message : erro
     );
 
-    return responder({
-      erro: "Falha ao consultar itens"
-    }, 503);
-  }
-
-  if (
-    !validarItens(
-      itens,
-      pedido.valor_total
-    )
-  ) {
-    return responder({
-      erro: "Itens invalidos ou valor divergente"
-    }, 409);
-  }
-
-  // ----------------------------------------------
-  // 11. PREPARAR TRANSACAO
-  // ----------------------------------------------
-
-  const {
-    comandos,
-    principal
-  } = prepararTransacao(
-    env.DB,
-    pedido,
-    itens,
-    cobrancasPagas
-  );
-
-  // ----------------------------------------------
-  // 12. EXECUTAR TRANSACAO ATOMICA
-  // ----------------------------------------------
-
-  try {
-    await env.DB.batch(comandos);
-  } catch (erro) {
-    console.error(
-      "CONFIRMACAO FALHOU",
-      {
-        pedidoId,
-        erro:
-          erro instanceof Error
-            ? erro.message
-            : "Erro desconhecido"
-      }
-    );
-
-    return responder({
-      erro: "Nao foi possivel confirmar o pedido",
+    return json({
+      erro: "Nao foi possivel concluir a operacao",
       pedidoId,
       mensagem:
-        "Transacao nao concluida. Verifique o D1 antes de repetir."
+        "Verifique o D1 antes de repetir a confirmacao."
     }, 409);
   }
-
-  // ----------------------------------------------
-  // 13. RETORNAR SUCESSO
-  // ----------------------------------------------
-
-  return responder({
-    ambiente: "SANDBOX",
-    pedidoId,
-    referencia: pedido.referencia,
-    status: "PAGO",
-    pagamentoConfirmado: true,
-    estoqueAlterado: true,
-    ordemId: principal.ordemId,
-    cobrancaId: principal.cobrancaId,
-    valorPago: principal.valor,
-    quantidadeCobrancas: cobrancasPagas.length,
-    cobrancasDuplicadas:
-      cobrancasPagas.length - 1,
-    revisaoNecessaria:
-      cobrancasPagas.length > 1,
-    mensagem:
-      "Pedido confirmado uma vez. Cobrancas adicionais registradas para revisao."
-  });
 }
 
-// ==================================================
-// BLOQUEAR GET
-// ==================================================
-
 export function onRequestGet() {
-  return responder({
-    erro: "Metodo nao permitido"
+  return json({
+    erro: "Metodo nao permitido. Utilize POST."
   }, 405);
 }

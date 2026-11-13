@@ -1,29 +1,14 @@
 
 /*
  * URBAN KICKS
- * CHECKOUT DE PRODUCAO PROTEGIDO
- *
- * Cloudflare Pages Functions + D1
- *
- * POST /api/checkout-producao
- *
- * Header:
- * x-checkout-test-key
- *
- * Body:
- * {
- *   "items": [
- *     {"id": 1, "size": "40", "quantity": 1}
- *   ]
- * }
- *
- * Uso exclusivo para teste administrativo.
+ * Checkout PagBank producao + Turnstile
+ * Uso administrativo durante os testes.
  */
 
 const SITE_URL = "https://urban-kicks.pages.dev";
-
-const PAGBANK_API =
-  "https://api.pagseguro.com/checkouts";
+const PAGBANK_API = "https://api.pagseguro.com/checkouts";
+const TURNSTILE_API =
+  "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
 const PRODUTOS = {
   1: { nome: "New Balance — Cinza Urbano", valor: 39990 },
@@ -39,9 +24,7 @@ const PRODUTOS = {
 function responder(dados, status = 200) {
   return Response.json(dados, {
     status,
-    headers: {
-      "Cache-Control": "no-store"
-    }
+    headers: { "Cache-Control": "no-store" }
   });
 }
 
@@ -51,9 +34,7 @@ function chaveIgual(a, b) {
     typeof b !== "string" ||
     !a.length ||
     a.length !== b.length
-  ) {
-    return false;
-  }
+  ) return false;
 
   let diferenca = 0;
 
@@ -65,29 +46,69 @@ function chaveIgual(a, b) {
 }
 
 function linkValido(link) {
-  if (typeof link !== "string") {
-    return false;
-  }
+  if (typeof link !== "string") return false;
 
   try {
     const url = new URL(link);
 
-    if (
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      url.port
-    ) {
-      return false;
-    }
-
-    return [
-      "pagamento.pagbank.com.br",
-      "pagamento.pagseguro.uol.com.br"
-    ].includes(url.hostname.toLowerCase());
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      [
+        "pagamento.pagbank.com.br",
+        "pagamento.pagseguro.uol.com.br"
+      ].includes(url.hostname.toLowerCase())
+    );
   } catch {
     return false;
   }
+}
+
+async function validarTurnstile(token, request, env) {
+  if (
+    typeof token !== "string" ||
+    token.length < 1 ||
+    token.length > 2048
+  ) {
+    return { valido: false, motivo: "Token ausente" };
+  }
+
+  const dados = new FormData();
+  dados.append("secret", env.TURNSTILE_SECRET_KEY);
+  dados.append("response", token);
+
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (ip) dados.append("remoteip", ip);
+
+  let resposta;
+
+  try {
+    resposta = await fetch(TURNSTILE_API, {
+      method: "POST",
+      body: dados,
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {
+    return { valido: false, indisponivel: true };
+  }
+
+  if (!resposta.ok) {
+    return { valido: false, indisponivel: true };
+  }
+
+  const resultado = await resposta.json().catch(() => null);
+
+  if (!resultado || resultado.success !== true) {
+    return { valido: false };
+  }
+
+  if (resultado.hostname !== "urban-kicks.pages.dev") {
+    return { valido: false };
+  }
+
+  return { valido: true };
 }
 
 async function consultarEstoque(DB, produtos) {
@@ -97,15 +118,14 @@ async function consultarEstoque(DB, produtos) {
       FROM estoque
       WHERE produto_id = ?
         AND CAST(tamanho AS TEXT) = ?
-    `).bind(
-      item.id,
-      item.tamanho
-    ).first();
+    `).bind(item.id, item.tamanho).first();
+
+    const quantidade = Number(estoque?.quantidade);
 
     if (
       !estoque ||
-      !Number.isSafeInteger(estoque.quantidade) ||
-      estoque.quantidade < item.quantidade
+      !Number.isSafeInteger(quantidade) ||
+      quantidade < item.quantidade
     ) {
       return {
         disponivel: false,
@@ -118,40 +138,32 @@ async function consultarEstoque(DB, produtos) {
   return { disponivel: true };
 }
 
-export async function onRequestPost({
-  request,
-  env
-}) {
-  // Bloqueia qualquer acesso sem configuracao.
+export async function onRequestPost({ request, env }) {
   if (
     !env.DB ||
     !env.PAGBANK_TOKEN_PRODUCAO ||
-    !env.CHECKOUT_TESTE_KEY
+    !env.CHECKOUT_TESTE_KEY ||
+    !env.TURNSTILE_SECRET_KEY
   ) {
     return responder({
       erro: "Configuracao incompleta"
     }, 503);
   }
 
-  // Autenticacao administrativa obrigatoria.
+  // Mantem o checkout real restrito a testes administrativos.
   if (!chaveIgual(
     request.headers.get("x-checkout-test-key"),
     env.CHECKOUT_TESTE_KEY
   )) {
-    return responder({
-      erro: "Nao autorizado"
-    }, 401);
+    return responder({ erro: "Nao autorizado" }, 401);
   }
 
-  // Nao permite carrinhos muito grandes.
   let entrada;
 
   try {
     entrada = await request.json();
   } catch {
-    return responder({
-      erro: "JSON invalido"
-    }, 400);
+    return responder({ erro: "JSON invalido" }, 400);
   }
 
   if (
@@ -160,9 +172,23 @@ export async function onRequestPost({
     entrada.items.length < 1 ||
     entrada.items.length > 20
   ) {
+    return responder({ erro: "Carrinho invalido" }, 400);
+  }
+
+  // A verificacao acontece antes de criar pedido ou
+  // chamar a API de pagamentos.
+  const verificacao = await validarTurnstile(
+    entrada.turnstileToken,
+    request,
+    env
+  );
+
+  if (!verificacao.valido) {
     return responder({
-      erro: "Carrinho invalido"
-    }, 400);
+      erro: verificacao.indisponivel
+        ? "Servico de verificacao indisponivel"
+        : "Verificacao de seguranca invalida ou expirada"
+    }, verificacao.indisponivel ? 503 : 403);
   }
 
   const agrupados = new Map();
@@ -174,10 +200,7 @@ export async function onRequestPost({
 
     if (
       !Number.isSafeInteger(id) ||
-      !Object.prototype.hasOwnProperty.call(
-        PRODUTOS,
-        id
-      ) ||
+      !Object.prototype.hasOwnProperty.call(PRODUTOS, id) ||
       !/^\d{2}$/.test(tamanho) ||
       Number(tamanho) < 34 ||
       Number(tamanho) > 44 ||
@@ -186,15 +209,13 @@ export async function onRequestPost({
       quantidade > 5
     ) {
       return responder({
-        erro: "Produto ou quantidade invalida"
+        erro: "Produto, tamanho ou quantidade invalida"
       }, 400);
     }
 
     const chave = id + "-" + tamanho;
-
     const acumulado =
-      (agrupados.get(chave)?.quantidade || 0) +
-      quantidade;
+      (agrupados.get(chave)?.quantidade || 0) + quantidade;
 
     if (acumulado > 5) {
       return responder({
@@ -225,10 +246,7 @@ export async function onRequestPost({
       }, 409);
     }
   } catch (erro) {
-    console.error(
-      "ERRO_ESTOQUE_PRODUCAO",
-      erro instanceof Error ? erro.message : String(erro)
-    );
+    console.error("ERRO_ESTOQUE_PRODUCAO", String(erro));
 
     return responder({
       erro: "Falha na verificacao do estoque"
@@ -237,18 +255,15 @@ export async function onRequestPost({
 
   const itens = produtos.map(item => ({
     reference_id: item.id + "-" + item.tamanho,
-    name:
-      PRODUTOS[item.id].nome +
-      " - Tamanho " +
-      item.tamanho,
+    name: PRODUTOS[item.id].nome +
+      " - Tamanho " + item.tamanho,
     quantity: item.quantidade,
     unit_amount: PRODUTOS[item.id].valor
   }));
 
   const valorTotal = produtos.reduce(
     (total, item) =>
-      total +
-      PRODUTOS[item.id].valor * item.quantidade,
+      total + PRODUTOS[item.id].valor * item.quantidade,
     0
   );
 
@@ -256,21 +271,13 @@ export async function onRequestPost({
     !Number.isSafeInteger(valorTotal) ||
     valorTotal <= 0
   ) {
-    return responder({
-      erro: "Valor invalido"
-    }, 400);
+    return responder({ erro: "Valor invalido" }, 400);
   }
 
   const referencia = "UK-" + crypto.randomUUID();
 
-  /*
-   * Registra primeiro o pedido como
-   * PREPARANDO. Isso permite rastrear
-   * falhas posteriores na API PagBank.
-   *
-   * O conciliador so consulta pedidos
-   * PENDENTE com checkout_id.
-   */
+  // Primeiro registra o pedido para rastreamento.
+  // O conciliador nao deve processar PREPARANDO.
   try {
     const comandos = [
       env.DB.prepare(`
@@ -281,17 +288,8 @@ export async function onRequestPost({
           valor_total,
           ambiente
         )
-        VALUES (
-          ?,
-          NULL,
-          'PREPARANDO',
-          ?,
-          'PRODUCAO'
-        )
-      `).bind(
-        referencia,
-        valorTotal
-      )
+        VALUES (?, NULL, 'PREPARANDO', ?, 'PRODUCAO')
+      `).bind(referencia, valorTotal)
     ];
 
     for (const item of produtos) {
@@ -305,8 +303,7 @@ export async function onRequestPost({
             quantidade,
             preco_unitario
           )
-          SELECT
-            id, ?, ?, ?, ?, ?
+          SELECT id, ?, ?, ?, ?, ?
           FROM pedidos
           WHERE referencia = ?
             AND ambiente = 'PRODUCAO'
@@ -323,22 +320,14 @@ export async function onRequestPost({
 
     await env.DB.batch(comandos);
   } catch (erro) {
-    console.error(
-      "ERRO_PREPARAR_PEDIDO",
-      erro instanceof Error ? erro.message : String(erro)
-    );
+    console.error("ERRO_PREPARAR_PEDIDO", String(erro));
 
     return responder({
       erro: "Falha ao preparar pedido no D1"
     }, 503);
   }
 
-  /*
-   * Cria checkout real.
-   * Nao retorna link se nao conseguir
-   * salvar o checkout_id no D1.
-   */
-  let dados;
+  let dadosPagBank;
 
   try {
     const resposta = await fetch(PAGBANK_API, {
@@ -368,7 +357,7 @@ export async function onRequestPost({
       signal: AbortSignal.timeout(20000)
     });
 
-    dados = await resposta.json().catch(() => ({}));
+    dadosPagBank = await resposta.json().catch(() => ({}));
 
     if (!resposta.ok) {
       console.error(
@@ -383,20 +372,17 @@ export async function onRequestPost({
       }, 502);
     }
   } catch (erro) {
-    console.error(
-      "ERRO_PAGBANK_PRODUCAO",
-      erro instanceof Error ? erro.message : String(erro)
-    );
+    console.error("ERRO_PAGBANK_PRODUCAO", String(erro));
 
     return responder({
       erro: "Falha na comunicacao com PagBank",
       referencia,
       mensagem:
-        "Nao repita a operacao sem verificar o pedido."
+        "Verifique o pedido antes de tentar novamente."
     }, 502);
   }
 
-  const checkoutId = dados.id;
+  const checkoutId = dadosPagBank?.id;
 
   if (
     typeof checkoutId !== "string" ||
@@ -408,13 +394,12 @@ export async function onRequestPost({
     }, 502);
   }
 
-  // Preserva o checkout_id mesmo quando o link de pagamento
-  // estiver ausente ou invalido. O pedido continua PREPARANDO
-  // e NAO sera selecionado pelo conciliador automatico.
+  // Salva o identificador antes de disponibilizar o link.
   try {
     const salvo = await env.DB.prepare(`
       UPDATE pedidos
-      SET checkout_id = ?, atualizado_em = CURRENT_TIMESTAMP
+      SET checkout_id = ?,
+          atualizado_em = CURRENT_TIMESTAMP
       WHERE referencia = ?
         AND ambiente = 'PRODUCAO'
         AND status = 'PREPARANDO'
@@ -422,20 +407,20 @@ export async function onRequestPost({
     `).bind(checkoutId, referencia).run();
 
     if (salvo.meta?.changes !== 1) {
-      throw new Error('Falha ao registrar checkout_id');
+      throw new Error("Checkout nao registrado");
     }
   } catch (erro) {
-    console.error('ERRO_SALVAR_CHECKOUT_ID',
-      erro instanceof Error ? erro.message : String(erro));
+    console.error("ERRO_SALVAR_CHECKOUT_ID", String(erro));
+
     return responder({
-      erro: 'Checkout criado, mas identificador nao registrado',
+      erro: "Checkout criado, mas nao registrado",
       referencia,
-      mensagem: 'Nao efetue pagamento. Necessaria revisao manual.'
+      mensagem: "Nao efetue pagamento. Revisao necessaria."
     }, 503);
   }
 
-  const link = Array.isArray(dados.links)
-    ? dados.links.find(
+  const link = Array.isArray(dadosPagBank.links)
+    ? dadosPagBank.links.find(
         item => item.rel === "PAY"
       )?.href
     : null;
@@ -448,55 +433,37 @@ export async function onRequestPost({
     }, 502);
   }
 
-  /*
-   * Ativa o pedido para conciliacao.
-   * O checkout so e devolvido depois
-   * que o banco confirma a gravacao.
-   */
+  // Somente agora ativa a conciliacao automatica.
   try {
     const resultado = await env.DB.prepare(`
       UPDATE pedidos
-      SET
-        status = 'PENDENTE',
-        atualizado_em = CURRENT_TIMESTAMP
+      SET status = 'PENDENTE',
+          atualizado_em = CURRENT_TIMESTAMP
       WHERE referencia = ?
         AND ambiente = 'PRODUCAO'
         AND status = 'PREPARANDO'
         AND checkout_id = ?
-    `).bind(
-      referencia,
-      checkoutId
-    ).run();
+    `).bind(referencia, checkoutId).run();
 
     if (resultado.meta?.changes !== 1) {
-      throw new Error(
-        "Pedido nao atualizado"
-      );
+      throw new Error("Pedido nao ativado");
     }
   } catch (erro) {
-    console.error(
-      "ERRO_ATIVAR_PEDIDO",
-      erro instanceof Error ? erro.message : String(erro)
-    );
+    console.error("ERRO_ATIVAR_PEDIDO", String(erro));
 
     return responder({
-      erro:
-        "Checkout criado, mas nao foi possivel ativar o pedido",
+      erro: "Checkout criado, mas pedido nao ativado",
       referencia,
       checkoutId,
-      mensagem:
-        "Nao efetue o pagamento. Verifique o D1."
+      mensagem: "Nao efetue pagamento. Verifique o D1."
     }, 503);
   }
 
-  console.log(
-    "CHECKOUT_REAL_TESTE_CRIADO",
-    {
-      referencia,
-      checkoutId,
-      valorTotal
-    }
-  );
+  console.log("CHECKOUT_REAL_TESTE_CRIADO", {
+    referencia,
+    checkoutId,
+    valorTotal
+  });
 
   return responder({
     checkoutUrl: link,

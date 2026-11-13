@@ -1,66 +1,39 @@
 
-/*
- * URBAN KICKS
- * Checkout PagBank producao + Turnstile
- * Uso administrativo durante os testes.
- */
-
-const SITE_URL = "https://urban-kicks.pages.dev";
-const PAGBANK_API = "https://api.pagseguro.com/checkouts";
-const TURNSTILE_API =
-  "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+/* URBAN KICKS - checkout PagBank de produção protegido por Turnstile */
+const SITE_URL = 'https://urban-kicks.pages.dev';
+const PAGBANK_API = 'https://api.pagseguro.com/checkouts';
+const TURNSTILE_API = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
 const PRODUTOS = {
-  1: { nome: "New Balance — Cinza Urbano", valor: 39990 },
-  2: { nome: "Nike TN — Edição Iridescente", valor: 44990 },
-  3: { nome: "Nike Air Max Plus — Preto e Prata", valor: 42990 },
-  4: { nome: "Nike Shox — Total Black", valor: 49990 },
-  5: { nome: "Nike Air Max Plus — Blue Gradient", valor: 44990 },
-  6: { nome: "Nike Shox — Marrom Escuro", valor: 48990 },
-  7: { nome: "Nike P-6000 — Branco", valor: 37990 },
-  8: { nome: "Nike P-6000 — Branco Lateral", valor: 37990 }
+  1: { nome: 'New Balance — Cinza Urbano', valor: 39990 },
+  2: { nome: 'Nike TN — Edição Iridescente', valor: 44990 },
+  3: { nome: 'Nike Air Max Plus — Preto e Prata', valor: 42990 },
+  4: { nome: 'Nike Shox — Total Black', valor: 49990 },
+  5: { nome: 'Nike Air Max Plus — Blue Gradient', valor: 44990 },
+  6: { nome: 'Nike Shox — Marrom Escuro', valor: 48990 },
+  7: { nome: 'Nike P-6000 — Branco', valor: 37990 },
+  8: { nome: 'Nike P-6000 — Branco Lateral', valor: 37990 }
 };
 
 function responder(dados, status = 200) {
   return Response.json(dados, {
     status,
-    headers: { "Cache-Control": "no-store" }
+    headers: { 'Cache-Control': 'no-store' }
   });
 }
 
-function chaveIgual(a, b) {
-  if (
-    typeof a !== "string" ||
-    typeof b !== "string" ||
-    !a.length ||
-    a.length !== b.length
-  ) return false;
-
-  let diferenca = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    diferenca |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-
-  return diferenca === 0;
-}
-
 function linkValido(link) {
-  if (typeof link !== "string") return false;
-
+  if (typeof link !== 'string') return false;
   try {
     const url = new URL(link);
-
-    return (
-      url.protocol === "https:" &&
+    return url.protocol === 'https:' &&
       !url.username &&
       !url.password &&
       !url.port &&
       [
-        "pagamento.pagbank.com.br",
-        "pagamento.pagseguro.uol.com.br"
-      ].includes(url.hostname.toLowerCase())
-    );
+        'pagamento.pagbank.com.br',
+        'pagamento.pagseguro.uol.com.br'
+      ].includes(url.hostname.toLowerCase());
   } catch {
     return false;
   }
@@ -68,25 +41,25 @@ function linkValido(link) {
 
 async function validarTurnstile(token, request, env) {
   if (
-    typeof token !== "string" ||
+    typeof token !== 'string' ||
     token.length < 1 ||
     token.length > 2048
   ) {
-    return { valido: false, motivo: "Token ausente" };
+    return { valido: false, motivo: 'Token ausente' };
   }
 
   const dados = new FormData();
-  dados.append("secret", env.TURNSTILE_SECRET_KEY);
-  dados.append("response", token);
+  dados.append('secret', env.TURNSTILE_SECRET_KEY);
+  dados.append('response', token);
 
-  const ip = request.headers.get("CF-Connecting-IP");
-  if (ip) dados.append("remoteip", ip);
+  const ip = request.headers.get('CF-Connecting-IP');
+  if (ip) dados.append('remoteip', ip);
 
   let resposta;
 
   try {
     resposta = await fetch(TURNSTILE_API, {
-      method: "POST",
+      method: 'POST',
       body: dados,
       signal: AbortSignal.timeout(10000)
     });
@@ -100,11 +73,11 @@ async function validarTurnstile(token, request, env) {
 
   const resultado = await resposta.json().catch(() => null);
 
-  if (!resultado || resultado.success !== true) {
-    return { valido: false };
-  }
-
-  if (resultado.hostname !== "urban-kicks.pages.dev") {
+  if (
+    !resultado ||
+    resultado.success !== true ||
+    resultado.hostname !== 'urban-kicks.pages.dev'
+  ) {
     return { valido: false };
   }
 
@@ -114,8 +87,7 @@ async function validarTurnstile(token, request, env) {
 async function consultarEstoque(DB, produtos) {
   for (const item of produtos) {
     const estoque = await DB.prepare(`
-      SELECT quantidade
-      FROM estoque
+      SELECT quantidade FROM estoque
       WHERE produto_id = ?
         AND CAST(tamanho AS TEXT) = ?
     `).bind(item.id, item.tamanho).first();
@@ -142,20 +114,9 @@ export async function onRequestPost({ request, env }) {
   if (
     !env.DB ||
     !env.PAGBANK_TOKEN_PRODUCAO ||
-    !env.CHECKOUT_TESTE_KEY ||
     !env.TURNSTILE_SECRET_KEY
   ) {
-    return responder({
-      erro: "Configuracao incompleta"
-    }, 503);
-  }
-
-  // Mantem o checkout real restrito a testes administrativos.
-  if (!chaveIgual(
-    request.headers.get("x-checkout-test-key"),
-    env.CHECKOUT_TESTE_KEY
-  )) {
-    return responder({ erro: "Nao autorizado" }, 401);
+    return responder({ erro: 'Configuracao incompleta' }, 503);
   }
 
   let entrada;
@@ -163,7 +124,7 @@ export async function onRequestPost({ request, env }) {
   try {
     entrada = await request.json();
   } catch {
-    return responder({ erro: "JSON invalido" }, 400);
+    return responder({ erro: 'JSON invalido' }, 400);
   }
 
   if (
@@ -172,11 +133,10 @@ export async function onRequestPost({ request, env }) {
     entrada.items.length < 1 ||
     entrada.items.length > 20
   ) {
-    return responder({ erro: "Carrinho invalido" }, 400);
+    return responder({ erro: 'Carrinho invalido' }, 400);
   }
 
-  // A verificacao acontece antes de criar pedido ou
-  // chamar a API de pagamentos.
+  // Validação de segurança no servidor.
   const verificacao = await validarTurnstile(
     entrada.turnstileToken,
     request,
@@ -186,8 +146,8 @@ export async function onRequestPost({ request, env }) {
   if (!verificacao.valido) {
     return responder({
       erro: verificacao.indisponivel
-        ? "Servico de verificacao indisponivel"
-        : "Verificacao de seguranca invalida ou expirada"
+        ? 'Servico de verificacao indisponivel'
+        : 'Verificacao de seguranca invalida ou expirada'
     }, verificacao.indisponivel ? 503 : 403);
   }
 
@@ -195,7 +155,7 @@ export async function onRequestPost({ request, env }) {
 
   for (const item of entrada.items) {
     const id = item?.id;
-    const tamanho = String(item?.size ?? "");
+    const tamanho = String(item?.size ?? '');
     const quantidade = item?.quantity;
 
     if (
@@ -209,17 +169,18 @@ export async function onRequestPost({ request, env }) {
       quantidade > 5
     ) {
       return responder({
-        erro: "Produto, tamanho ou quantidade invalida"
+        erro: 'Produto, tamanho ou quantidade invalida'
       }, 400);
     }
 
-    const chave = id + "-" + tamanho;
+    const chave = id + '-' + tamanho;
+
     const acumulado =
       (agrupados.get(chave)?.quantidade || 0) + quantidade;
 
     if (acumulado > 5) {
       return responder({
-        erro: "Limite por produto e tamanho excedido"
+        erro: 'Limite por produto e tamanho excedido'
       }, 400);
     }
 
@@ -240,23 +201,23 @@ export async function onRequestPost({ request, env }) {
 
     if (!disponibilidade.disponivel) {
       return responder({
-        erro: "Estoque insuficiente",
+        erro: 'Estoque insuficiente',
         produtoId: disponibilidade.produtoId,
         tamanho: disponibilidade.tamanho
       }, 409);
     }
   } catch (erro) {
-    console.error("ERRO_ESTOQUE_PRODUCAO", String(erro));
+    console.error('ERRO_ESTOQUE_PRODUCAO', String(erro));
 
     return responder({
-      erro: "Falha na verificacao do estoque"
+      erro: 'Falha na verificacao do estoque'
     }, 503);
   }
 
   const itens = produtos.map(item => ({
-    reference_id: item.id + "-" + item.tamanho,
+    reference_id: item.id + '-' + item.tamanho,
     name: PRODUTOS[item.id].nome +
-      " - Tamanho " + item.tamanho,
+      ' - Tamanho ' + item.tamanho,
     quantity: item.quantidade,
     unit_amount: PRODUTOS[item.id].valor
   }));
@@ -271,23 +232,17 @@ export async function onRequestPost({ request, env }) {
     !Number.isSafeInteger(valorTotal) ||
     valorTotal <= 0
   ) {
-    return responder({ erro: "Valor invalido" }, 400);
+    return responder({ erro: 'Valor invalido' }, 400);
   }
 
-  const referencia = "UK-" + crypto.randomUUID();
+  const referencia = 'UK-' + crypto.randomUUID();
 
-  // Primeiro registra o pedido para rastreamento.
-  // O conciliador nao deve processar PREPARANDO.
+  // Registra o pedido antes de criar o checkout.
   try {
     const comandos = [
       env.DB.prepare(`
-        INSERT INTO pedidos (
-          referencia,
-          checkout_id,
-          status,
-          valor_total,
-          ambiente
-        )
+        INSERT INTO pedidos
+          (referencia, checkout_id, status, valor_total, ambiente)
         VALUES (?, NULL, 'PREPARANDO', ?, 'PRODUCAO')
       `).bind(referencia, valorTotal)
     ];
@@ -295,14 +250,15 @@ export async function onRequestPost({ request, env }) {
     for (const item of produtos) {
       comandos.push(
         env.DB.prepare(`
-          INSERT INTO pedido_itens (
-            pedido_id,
-            produto_id,
-            produto_nome,
-            tamanho,
-            quantidade,
-            preco_unitario
-          )
+          INSERT INTO pedido_itens
+            (
+              pedido_id,
+              produto_id,
+              produto_nome,
+              tamanho,
+              quantidade,
+              preco_unitario
+            )
           SELECT id, ?, ?, ?, ?, ?
           FROM pedidos
           WHERE referencia = ?
@@ -320,10 +276,10 @@ export async function onRequestPost({ request, env }) {
 
     await env.DB.batch(comandos);
   } catch (erro) {
-    console.error("ERRO_PREPARAR_PEDIDO", String(erro));
+    console.error('ERRO_PREPARAR_PEDIDO', String(erro));
 
     return responder({
-      erro: "Falha ao preparar pedido no D1"
+      erro: 'Falha ao preparar pedido no D1'
     }, 503);
   }
 
@@ -331,27 +287,26 @@ export async function onRequestPost({ request, env }) {
 
   try {
     const resposta = await fetch(PAGBANK_API, {
-      method: "POST",
+      method: 'POST',
       headers: {
-        Authorization:
-          "Bearer " + env.PAGBANK_TOKEN_PRODUCAO,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "x-idempotency-key": referencia
+        Authorization: 'Bearer ' + env.PAGBANK_TOKEN_PRODUCAO,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'x-idempotency-key': referencia
       },
       body: JSON.stringify({
         reference_id: referencia,
         items: itens,
         payment_methods: [
-          { type: "PIX" },
-          { type: "CREDIT_CARD" }
+          { type: 'PIX' },
+          { type: 'CREDIT_CARD' }
         ],
-        return_url: SITE_URL + "/",
+        return_url: SITE_URL + '/',
         payment_notification_urls: [
-          SITE_URL + "/api/webhook"
+          SITE_URL + '/api/webhook'
         ],
         notification_urls: [
-          SITE_URL + "/api/webhook"
+          SITE_URL + '/api/webhook'
         ]
       }),
       signal: AbortSignal.timeout(20000)
@@ -361,40 +316,42 @@ export async function onRequestPost({ request, env }) {
 
     if (!resposta.ok) {
       console.error(
-        "PAGBANK_PRODUCAO_HTTP",
+        'PAGBANK_PRODUCAO_HTTP',
         resposta.status
       );
 
       return responder({
-        erro: "PagBank recusou o checkout real",
+        erro: 'PagBank recusou o checkout real',
         referencia,
         statusPagBank: resposta.status
       }, 502);
     }
   } catch (erro) {
-    console.error("ERRO_PAGBANK_PRODUCAO", String(erro));
+    console.error(
+      'ERRO_PAGBANK_PRODUCAO',
+      String(erro)
+    );
 
     return responder({
-      erro: "Falha na comunicacao com PagBank",
+      erro: 'Falha na comunicacao com PagBank',
       referencia,
-      mensagem:
-        "Verifique o pedido antes de tentar novamente."
+      mensagem: 'Verifique o pedido antes de tentar novamente.'
     }, 502);
   }
 
   const checkoutId = dadosPagBank?.id;
 
   if (
-    typeof checkoutId !== "string" ||
+    typeof checkoutId !== 'string' ||
     !/^CHEC_[A-F0-9-]{36}$/i.test(checkoutId)
   ) {
     return responder({
-      erro: "Checkout real sem identificador valido",
+      erro: 'Checkout real sem identificador valido',
       referencia
     }, 502);
   }
 
-  // Salva o identificador antes de disponibilizar o link.
+  // Salva o identificador do checkout.
   try {
     const salvo = await env.DB.prepare(`
       UPDATE pedidos
@@ -407,33 +364,36 @@ export async function onRequestPost({ request, env }) {
     `).bind(checkoutId, referencia).run();
 
     if (salvo.meta?.changes !== 1) {
-      throw new Error("Checkout nao registrado");
+      throw new Error('Checkout nao registrado');
     }
   } catch (erro) {
-    console.error("ERRO_SALVAR_CHECKOUT_ID", String(erro));
+    console.error(
+      'ERRO_SALVAR_CHECKOUT_ID',
+      String(erro)
+    );
 
     return responder({
-      erro: "Checkout criado, mas nao registrado",
+      erro: 'Checkout criado, mas nao registrado',
       referencia,
-      mensagem: "Nao efetue pagamento. Revisao necessaria."
+      mensagem: 'Nao efetue pagamento. Revisao necessaria.'
     }, 503);
   }
 
   const link = Array.isArray(dadosPagBank.links)
     ? dadosPagBank.links.find(
-        item => item.rel === "PAY"
+        item => item.rel === 'PAY'
       )?.href
     : null;
 
   if (!linkValido(link)) {
     return responder({
-      erro: "Link de pagamento real nao validado",
+      erro: 'Link de pagamento real nao validado',
       referencia,
       checkoutId
     }, 502);
   }
 
-  // Somente agora ativa a conciliacao automatica.
+  // Ativa o pedido para conciliação automática.
   try {
     const resultado = await env.DB.prepare(`
       UPDATE pedidos
@@ -446,20 +406,23 @@ export async function onRequestPost({ request, env }) {
     `).bind(referencia, checkoutId).run();
 
     if (resultado.meta?.changes !== 1) {
-      throw new Error("Pedido nao ativado");
+      throw new Error('Pedido nao ativado');
     }
   } catch (erro) {
-    console.error("ERRO_ATIVAR_PEDIDO", String(erro));
+    console.error(
+      'ERRO_ATIVAR_PEDIDO',
+      String(erro)
+    );
 
     return responder({
-      erro: "Checkout criado, mas pedido nao ativado",
+      erro: 'Checkout criado, mas pedido nao ativado',
       referencia,
       checkoutId,
-      mensagem: "Nao efetue pagamento. Verifique o D1."
+      mensagem: 'Nao efetue pagamento. Verifique o D1.'
     }, 503);
   }
 
-  console.log("CHECKOUT_REAL_TESTE_CRIADO", {
+  console.log('CHECKOUT_PRODUCAO_CRIADO', {
     referencia,
     checkoutId,
     valorTotal
@@ -469,16 +432,14 @@ export async function onRequestPost({ request, env }) {
     checkoutUrl: link,
     referencia,
     checkoutId,
-    ambiente: "PRODUCAO",
-    status: "PENDENTE",
-    valorTotal,
-    mensagem:
-      "Checkout real criado para teste administrativo."
+    ambiente: 'PRODUCAO',
+    status: 'PENDENTE',
+    valorTotal
   });
 }
 
 export function onRequestGet() {
   return responder({
-    erro: "Metodo nao permitido. Utilize POST."
+    erro: 'Metodo nao permitido. Utilize POST.'
   }, 405);
 }

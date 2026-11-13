@@ -408,6 +408,32 @@ export async function onRequestPost({
     }, 502);
   }
 
+  // Preserva o checkout_id mesmo quando o link de pagamento
+  // estiver ausente ou invalido. O pedido continua PREPARANDO
+  // e NAO sera selecionado pelo conciliador automatico.
+  try {
+    const salvo = await env.DB.prepare(`
+      UPDATE pedidos
+      SET checkout_id = ?, atualizado_em = CURRENT_TIMESTAMP
+      WHERE referencia = ?
+        AND ambiente = 'PRODUCAO'
+        AND status = 'PREPARANDO'
+        AND checkout_id IS NULL
+    `).bind(checkoutId, referencia).run();
+
+    if (salvo.meta?.changes !== 1) {
+      throw new Error('Falha ao registrar checkout_id');
+    }
+  } catch (erro) {
+    console.error('ERRO_SALVAR_CHECKOUT_ID',
+      erro instanceof Error ? erro.message : String(erro));
+    return responder({
+      erro: 'Checkout criado, mas identificador nao registrado',
+      referencia,
+      mensagem: 'Nao efetue pagamento. Necessaria revisao manual.'
+    }, 503);
+  }
+
   const link = Array.isArray(dados.links)
     ? dados.links.find(
         item => item.rel === "PAY"
@@ -431,15 +457,15 @@ export async function onRequestPost({
     const resultado = await env.DB.prepare(`
       UPDATE pedidos
       SET
-        checkout_id = ?,
         status = 'PENDENTE',
         atualizado_em = CURRENT_TIMESTAMP
       WHERE referencia = ?
         AND ambiente = 'PRODUCAO'
         AND status = 'PREPARANDO'
+        AND checkout_id = ?
     `).bind(
-      checkoutId,
-      referencia
+      referencia,
+      checkoutId
     ).run();
 
     if (resultado.meta?.changes !== 1) {

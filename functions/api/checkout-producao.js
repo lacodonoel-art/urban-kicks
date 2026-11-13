@@ -1,5 +1,6 @@
 
-/* URBAN KICKS - checkout PagBank de produção protegido por Turnstile */
+/* URBAN KICKS - Checkout PagBank de produção protegido por Turnstile */
+
 const SITE_URL = 'https://urban-kicks.pages.dev';
 const PAGBANK_API = 'https://api.pagseguro.com/checkouts';
 const TURNSTILE_API = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -24,8 +25,10 @@ function responder(dados, status = 200) {
 
 function linkValido(link) {
   if (typeof link !== 'string') return false;
+
   try {
     const url = new URL(link);
+
     return url.protocol === 'https:' &&
       !url.username &&
       !url.password &&
@@ -110,6 +113,34 @@ async function consultarEstoque(DB, produtos) {
   return { disponivel: true };
 }
 
+// Registra somente informações de diagnóstico.
+// Não registra tokens, dados de cartão ou dados pessoais.
+function registrarErroPagBank(status, dados) {
+  const mensagens = Array.isArray(dados?.error_messages)
+    ? dados.error_messages.map(item => ({
+        code: typeof item?.code === 'string'
+          ? item.code.slice(0, 100)
+          : null,
+        description: typeof item?.description === 'string'
+          ? item.description.slice(0, 300)
+          : null,
+        parameter_name: typeof item?.parameter_name === 'string'
+          ? item.parameter_name.slice(0, 100)
+          : null
+      }))
+    : null;
+
+  console.error('PAGBANK_PRODUCAO_HTTP', {
+    status,
+    codigo: typeof dados?.error === 'string'
+      ? dados.error.slice(0, 100)
+      : typeof dados?.code === 'string'
+        ? dados.code.slice(0, 100)
+        : null,
+    mensagens
+  });
+}
+
 export async function onRequestPost({ request, env }) {
   if (
     !env.DB ||
@@ -136,7 +167,6 @@ export async function onRequestPost({ request, env }) {
     return responder({ erro: 'Carrinho invalido' }, 400);
   }
 
-  // Validação de segurança no servidor.
   const verificacao = await validarTurnstile(
     entrada.turnstileToken,
     request,
@@ -237,7 +267,6 @@ export async function onRequestPost({ request, env }) {
 
   const referencia = 'UK-' + crypto.randomUUID();
 
-  // Registra o pedido antes de criar o checkout.
   try {
     const comandos = [
       env.DB.prepare(`
@@ -251,14 +280,14 @@ export async function onRequestPost({ request, env }) {
       comandos.push(
         env.DB.prepare(`
           INSERT INTO pedido_itens
-            (
-              pedido_id,
-              produto_id,
-              produto_nome,
-              tamanho,
-              quantidade,
-              preco_unitario
-            )
+          (
+            pedido_id,
+            produto_id,
+            produto_nome,
+            tamanho,
+            quantidade,
+            preco_unitario
+          )
           SELECT id, ?, ?, ?, ?, ?
           FROM pedidos
           WHERE referencia = ?
@@ -315,10 +344,7 @@ export async function onRequestPost({ request, env }) {
     dadosPagBank = await resposta.json().catch(() => ({}));
 
     if (!resposta.ok) {
-      console.error(
-        'PAGBANK_PRODUCAO_HTTP',
-        resposta.status
-      );
+      registrarErroPagBank(resposta.status, dadosPagBank);
 
       return responder({
         erro: 'PagBank recusou o checkout real',
@@ -351,7 +377,6 @@ export async function onRequestPost({ request, env }) {
     }, 502);
   }
 
-  // Salva o identificador do checkout.
   try {
     const salvo = await env.DB.prepare(`
       UPDATE pedidos
@@ -393,7 +418,6 @@ export async function onRequestPost({ request, env }) {
     }, 502);
   }
 
-  // Ativa o pedido para conciliação automática.
   try {
     const resultado = await env.DB.prepare(`
       UPDATE pedidos

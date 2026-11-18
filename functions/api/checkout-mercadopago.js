@@ -1,16 +1,18 @@
 
 /*
  * URBAN KICKS
- * Mercado Pago - PIX
+ * Mercado Pago - Checkout PIX
  * Cloudflare Pages Functions + D1
  *
- * Rota: POST /api/checkout-mercadopago
+ * POST /api/checkout-mercadopago
  *
- * Mantem os arquivos PagBank sem alteracoes.
- * Nao confirma pagamentos nem desconta estoque.
+ * Ambiente de teste.
+ * Nao altera os arquivos do PagBank.
+ * Nao desconta estoque antes da confirmacao.
  */
 
 const MP_API = "https://api.mercadopago.com/v1/orders";
+
 const TURNSTILE_API =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
@@ -44,11 +46,15 @@ async function validarTurnstile(token, request, env) {
   }
 
   const formulario = new FormData();
+
   formulario.append("secret", env.TURNSTILE_SECRET_KEY);
   formulario.append("response", token);
 
   const ip = request.headers.get("CF-Connecting-IP");
-  if (ip) formulario.append("remoteip", ip);
+
+  if (ip) {
+    formulario.append("remoteip", ip);
+  }
 
   try {
     const resposta = await fetch(TURNSTILE_API, {
@@ -57,7 +63,9 @@ async function validarTurnstile(token, request, env) {
       signal: AbortSignal.timeout(10000)
     });
 
-    if (!resposta.ok) return false;
+    if (!resposta.ok) {
+      return false;
+    }
 
     const dados = await resposta.json();
 
@@ -65,7 +73,12 @@ async function validarTurnstile(token, request, env) {
       dados.success === true &&
       dados.hostname === "urban-kicks.pages.dev"
     );
-  } catch {
+  } catch (erro) {
+    console.error(
+      "TURNSTILE_ERRO",
+      String(erro)
+    );
+
     return false;
   }
 }
@@ -77,7 +90,10 @@ async function verificarEstoque(DB, produtos) {
       FROM estoque
       WHERE produto_id = ?
         AND CAST(tamanho AS TEXT) = ?
-    `).bind(item.id, item.tamanho).first();
+    `).bind(
+      item.id,
+      item.tamanho
+    ).first();
 
     if (
       !registro ||
@@ -92,7 +108,18 @@ async function verificarEstoque(DB, produtos) {
     }
   }
 
-  return { disponivel: true };
+  return {
+    disponivel: true
+  };
+}
+
+function validarOrderId(id) {
+  return (
+    typeof id === "string" &&
+    id.length >= 1 &&
+    id.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(id)
+  );
 }
 
 export async function onRequestPost({ request, env }) {
@@ -111,7 +138,9 @@ export async function onRequestPost({ request, env }) {
   try {
     entrada = await request.json();
   } catch {
-    return responder({ erro: "JSON invalido" }, 400);
+    return responder({
+      erro: "JSON invalido"
+    }, 400);
   }
 
   if (
@@ -120,7 +149,9 @@ export async function onRequestPost({ request, env }) {
     entrada.items.length < 1 ||
     entrada.items.length > 20
   ) {
-    return responder({ erro: "Carrinho invalido" }, 400);
+    return responder({
+      erro: "Carrinho invalido"
+    }, 400);
   }
 
   const seguro = await validarTurnstile(
@@ -135,7 +166,9 @@ export async function onRequestPost({ request, env }) {
     }, 403);
   }
 
-  const email = String(entrada.email || "").trim();
+  const email = String(
+    entrada.email || ""
+  ).trim();
 
   if (
     email.length > 254 ||
@@ -150,12 +183,19 @@ export async function onRequestPost({ request, env }) {
 
   for (const item of entrada.items) {
     const id = item?.id;
-    const tamanho = String(item?.size ?? "");
+
+    const tamanho = String(
+      item?.size ?? ""
+    );
+
     const quantidade = item?.quantity;
 
     if (
       !Number.isSafeInteger(id) ||
-      !Object.prototype.hasOwnProperty.call(PRODUTOS, id) ||
+      !Object.prototype.hasOwnProperty.call(
+        PRODUTOS,
+        id
+      ) ||
       !/^\d{2}$/.test(tamanho) ||
       Number(tamanho) < 34 ||
       Number(tamanho) > 44 ||
@@ -169,6 +209,7 @@ export async function onRequestPost({ request, env }) {
     }
 
     const chave = id + "-" + tamanho;
+
     const acumulado =
       (agrupados.get(chave)?.quantidade || 0) +
       quantidade;
@@ -186,7 +227,9 @@ export async function onRequestPost({ request, env }) {
     });
   }
 
-  const produtos = [...agrupados.values()];
+  const produtos = [
+    ...agrupados.values()
+  ];
 
   try {
     const estoque = await verificarEstoque(
@@ -202,7 +245,10 @@ export async function onRequestPost({ request, env }) {
       }, 409);
     }
   } catch (erro) {
-    console.error("MP_ESTOQUE_ERRO", String(erro));
+    console.error(
+      "MP_ESTOQUE_ERRO",
+      String(erro)
+    );
 
     return responder({
       erro: "Nao foi possivel consultar estoque"
@@ -210,9 +256,12 @@ export async function onRequestPost({ request, env }) {
   }
 
   const totalCentavos = produtos.reduce(
-    (total, item) =>
-      total +
-      PRODUTOS[item.id].valor * item.quantidade,
+    (total, item) => {
+      return (
+        total +
+        PRODUTOS[item.id].valor * item.quantidade
+      );
+    },
     0
   );
 
@@ -225,28 +274,59 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
-  const valor = (totalCentavos / 100).toFixed(2);
-  const referencia = "UK-MP-" + crypto.randomUUID();
+  const valor = (
+    totalCentavos / 100
+  ).toFixed(2);
 
-  // Registra pedido e itens antes de criar o PIX.
-  // Nao desconta estoque nesta etapa.
+  const referencia =
+    "UK-MP-" + crypto.randomUUID();
+
+  /*
+   * Registra pedido e itens no D1.
+   * Nenhuma unidade e descontada aqui.
+   */
+
   try {
     const comandos = [
       env.DB.prepare(`
-        INSERT INTO pedidos
-          (referencia, checkout_id, status,
-           valor_total, ambiente)
-        VALUES (?, NULL, 'PREPARANDO', ?, 'TESTE_MP')
-      `).bind(referencia, totalCentavos)
+        INSERT INTO pedidos (
+          referencia,
+          checkout_id,
+          status,
+          valor_total,
+          ambiente
+        )
+        VALUES (
+          ?,
+          NULL,
+          'PREPARANDO',
+          ?,
+          'TESTE_MP'
+        )
+      `).bind(
+        referencia,
+        totalCentavos
+      )
     ];
 
     for (const item of produtos) {
       comandos.push(
         env.DB.prepare(`
-          INSERT INTO pedido_itens
-            (pedido_id, produto_id, produto_nome,
-             tamanho, quantidade, preco_unitario)
-          SELECT id, ?, ?, ?, ?, ?
+          INSERT INTO pedido_itens (
+            pedido_id,
+            produto_id,
+            produto_nome,
+            tamanho,
+            quantidade,
+            preco_unitario
+          )
+          SELECT
+            id,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?
           FROM pedidos
           WHERE referencia = ?
             AND ambiente = 'TESTE_MP'
@@ -263,12 +343,19 @@ export async function onRequestPost({ request, env }) {
 
     await env.DB.batch(comandos);
   } catch (erro) {
-    console.error("MP_D1_PREPARAR", String(erro));
+    console.error(
+      "MP_D1_PREPARAR",
+      String(erro)
+    );
 
     return responder({
       erro: "Falha ao registrar pedido"
     }, 503);
   }
+
+  /*
+   * Cria a Order PIX no Mercado Pago.
+   */
 
   const corpo = {
     type: "online",
@@ -298,22 +385,32 @@ export async function onRequestPost({ request, env }) {
       method: "POST",
       headers: {
         Authorization:
-          "Bearer " + env.MERCADOPAGO_ACCESS_TOKEN,
+          "Bearer " +
+          env.MERCADOPAGO_ACCESS_TOKEN,
         "Content-Type": "application/json",
         Accept: "application/json",
-        "X-Idempotency-Key": crypto.randomUUID()
+        "X-Idempotency-Key":
+          crypto.randomUUID()
       },
       body: JSON.stringify(corpo),
       signal: AbortSignal.timeout(20000)
     });
 
-    ordem = await resposta.json().catch(() => ({}));
+    ordem = await resposta.json().catch(
+      () => ({})
+    );
 
     if (!resposta.ok) {
-      console.error("MP_ORDER_HTTP", {
-        status: resposta.status,
-        codigo: ordem?.error || ordem?.code || null
-      });
+      console.error(
+        "MP_ORDER_HTTP",
+        JSON.stringify({
+          status: resposta.status,
+          codigo:
+            ordem?.error ||
+            ordem?.code ||
+            null
+        })
+      );
 
       return responder({
         erro: "Mercado Pago recusou o pagamento",
@@ -322,78 +419,120 @@ export async function onRequestPost({ request, env }) {
       }, 502);
     }
   } catch (erro) {
-    console.error("MP_ORDER_REDE", String(erro));
+    console.error(
+      "MP_ORDER_REDE",
+      String(erro)
+    );
 
     return responder({
       erro: "Falha de comunicacao com Mercado Pago",
       referencia,
-      mensagem: "Verifique o pedido antes de tentar novamente."
+      mensagem:
+        "Verifique o pedido antes de tentar novamente."
     }, 502);
   }
 
+  /*
+   * Validacao corrigida:
+   * nao exige prefixo ORD.
+   */
+
   const orderId = ordem?.id;
 
-  if (
-    typeof orderId !== "string" ||
-    !/^ORD[A-Za-z0-9_-]+$/.test(orderId)
-  ) {
+  if (!validarOrderId(orderId)) {
+    console.error(
+      "MP_ORDER_ID_INVALIDO",
+      JSON.stringify({
+        tipo: typeof orderId
+      })
+    );
+
     return responder({
       erro: "Identificador da order invalido",
       referencia
     }, 502);
   }
 
+  /*
+   * Salva o identificador da Order no D1.
+   */
+
   try {
     const salvo = await env.DB.prepare(`
       UPDATE pedidos
-      SET checkout_id = ?,
-          status = 'PENDENTE',
-          atualizado_em = CURRENT_TIMESTAMP
+      SET
+        checkout_id = ?,
+        status = 'PENDENTE',
+        atualizado_em = CURRENT_TIMESTAMP
       WHERE referencia = ?
         AND ambiente = 'TESTE_MP'
         AND status = 'PREPARANDO'
         AND checkout_id IS NULL
-    `).bind(orderId, referencia).run();
+    `).bind(
+      orderId,
+      referencia
+    ).run();
 
     if (salvo.meta?.changes !== 1) {
-      throw new Error("Pedido nao atualizado");
+      throw new Error(
+        "Pedido nao atualizado"
+      );
     }
   } catch (erro) {
-    console.error("MP_D1_SALVAR", String(erro));
+    console.error(
+      "MP_D1_SALVAR",
+      String(erro)
+    );
 
     return responder({
-      erro: "Order criada, mas nao registrada corretamente",
+      erro:
+        "Order criada, mas nao registrada corretamente",
       referencia,
-      mensagem: "Nao efetue o pagamento. Contate a loja."
+      mensagem:
+        "Nao efetue o pagamento. Contate a loja."
     }, 503);
   }
 
-  const pagamento = ordem?.transactions?.payments?.[0];
-  const metodo = pagamento?.payment_method || {};
+  /*
+   * Extrai os dados do PIX.
+   */
+
+  const pagamento =
+    ordem?.transactions?.payments?.[0];
+
+  const metodo =
+    pagamento?.payment_method || {};
+
+  const copiaECola =
+    typeof metodo.qr_code === "string"
+      ? metodo.qr_code
+      : null;
+
+  const qrCodeBase64 =
+    typeof metodo.qr_code_base64 === "string"
+      ? metodo.qr_code_base64
+      : null;
+
+  const ticketUrl =
+    typeof metodo.ticket_url === "string" &&
+    metodo.ticket_url.startsWith(
+      "https://www.mercadopago.com.br/"
+    )
+      ? metodo.ticket_url
+      : null;
 
   return responder({
     referencia,
     orderId,
     ambiente: "TESTE_MP",
     status: "PENDENTE",
-    statusMercadoPago: ordem.status || null,
+    statusMercadoPago:
+      ordem.status || null,
     valorTotal: totalCentavos,
     pix: {
-      copiaECola:
-        typeof metodo.qr_code === "string"
-          ? metodo.qr_code
-          : null,
-      qrCodeBase64:
-        typeof metodo.qr_code_base64 === "string"
-          ? metodo.qr_code_base64
-          : null,
-      ticketUrl:
-        typeof metodo.ticket_url === "string" &&
-        metodo.ticket_url.startsWith(
-          "https://www.mercadopago.com.br/"
-        )
-          ? metodo.ticket_url
-          : null
+      copiaECola,
+      qrCodeBase64,
+      ticketUrl
     },
     mensagem:
       "Pagamento ainda nao confirmado. Aguarde a conciliacao."
@@ -402,6 +541,7 @@ export async function onRequestPost({ request, env }) {
 
 export function onRequestGet() {
   return responder({
-    erro: "Metodo nao permitido. Utilize POST."
+    erro:
+      "Metodo nao permitido. Utilize POST."
   }, 405);
 }

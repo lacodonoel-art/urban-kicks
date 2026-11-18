@@ -1,725 +1,559 @@
 
 /*
  * URBAN KICKS
- * MERCADO PAGO - CHECKOUT PIX
+ * Checkout Mercado Pago - PIX e Cartao de Credito
  * Cloudflare Pages Functions + D1
  *
  * Rota: POST /api/checkout-mercadopago
  *
- * Ambiente: SANDBOX
- * Pedidos identificados por UK-MP-
+ * Requer:
+ * env.DB
+ * env.MERCADOPAGO_ACCESS_TOKEN
+ * env.TURNSTILE_SECRET_KEY
  *
- * Nao modifica o PagBank.
- * Nao confirma pagamentos.
- * Nao desconta estoque.
+ * ATENCAO:
+ * Este endpoint cria pagamentos.
+ * A confirmacao definitiva e a baixa de estoque
+ * devem acontecer no webhook validado.
  */
 
-const MP_API =
-  "https://api.mercadopago.com/v1/orders";
-
+const MP_API = "https://api.mercadopago.com/v1/orders";
 const TURNSTILE_API =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
-const AMBIENTE = "SANDBOX";
-const PREFIXO = "UK-MP-";
-
 const PRODUTOS = {
-  1: {
-    nome: "New Balance — Cinza Urbano",
-    valor: 39990
-  },
-  2: {
-    nome: "Nike TN — Edição Iridescente",
-    valor: 44990
-  },
-  3: {
-    nome: "Nike Air Max Plus — Preto e Prata",
-    valor: 42990
-  },
-  4: {
-    nome: "Nike Shox — Total Black",
-    valor: 49990
-  },
-  5: {
-    nome: "Nike Air Max Plus — Blue Gradient",
-    valor: 44990
-  },
-  6: {
-    nome: "Nike Shox — Marrom Escuro",
-    valor: 48990
-  },
-  7: {
-    nome: "Nike P-6000 — Branco",
-    valor: 37990
-  },
-  8: {
-    nome: "Nike P-6000 — Branco Lateral",
-    valor: 37990
-  }
+  1: { nome: "New Balance - Cinza Urbano", preco: 39990 },
+  2: { nome: "Nike TN - Edicao Iridescente", preco: 44990 },
+  3: { nome: "Nike Air Max Plus - Preto e Prata", preco: 42990 },
+  4: { nome: "Nike Shox - Total Black", preco: 49990 },
+  5: { nome: "Nike Air Max Plus - Blue Gradient", preco: 44990 },
+  6: { nome: "Nike Shox - Marrom Escuro", preco: 48990 },
+  7: { nome: "Nike P-6000 - Branco", preco: 37990 },
+  8: { nome: "Nike P-6000 - Branco Lateral", preco: 37990 }
 };
 
 function responder(dados, status = 200) {
-  return Response.json(dados, {
+  return new Response(JSON.stringify(dados), {
     status,
     headers: {
-      "Cache-Control": "no-store"
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff"
     }
   });
 }
 
-function identificadorValido(valor) {
+function dinheiro(centavos) {
+  return (centavos / 100).toFixed(2);
+}
+
+function emailValido(email) {
   return (
-    typeof valor === "string" &&
-    valor.length >= 1 &&
-    valor.length <= 128 &&
-    /^[A-Za-z0-9_-]+$/.test(valor)
+    typeof email === "string" &&
+    email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
   );
 }
 
-async function validarTurnstile(
-  token,
-  request,
-  env
-) {
-  if (
-    typeof token !== "string" ||
-    token.length < 1 ||
-    token.length > 2048
-  ) {
-    return false;
-  }
-
-  const formulario = new FormData();
-
-  formulario.append(
-    "secret",
-    env.TURNSTILE_SECRET_KEY
-  );
-
-  formulario.append(
-    "response",
-    token
-  );
-
-  const ip = request.headers.get(
-    "CF-Connecting-IP"
-  );
-
-  if (ip) {
-    formulario.append("remoteip", ip);
-  }
-
-  try {
-    const resposta = await fetch(
-      TURNSTILE_API,
-      {
-        method: "POST",
-        body: formulario,
-        signal: AbortSignal.timeout(10000)
-      }
-    );
-
-    if (!resposta.ok) {
-      return false;
-    }
-
-    const dados = await resposta.json();
-
-    return (
-      dados.success === true &&
-      dados.hostname ===
-        "urban-kicks.pages.dev"
-    );
-  } catch (erro) {
-    console.error(
-      "MP_TURNSTILE",
-      String(erro)
-    );
-
-    return false;
-  }
-}
-
-function validarCarrinho(items) {
-  if (
-    !Array.isArray(items) ||
-    items.length < 1 ||
-    items.length > 20
-  ) {
-    return {
-      erro: "Carrinho invalido"
-    };
+function normalizarItens(items) {
+  if (!Array.isArray(items) || items.length < 1 || items.length > 20) {
+    throw new Error("Carrinho invalido.");
   }
 
   const agrupados = new Map();
 
   for (const item of items) {
-    const id = item?.id;
-    const tamanho = String(
-      item?.size ?? ""
-    );
-    const quantidade = item?.quantity;
+    const id = Number(item.id ?? item.produto_id);
+    const tamanho = String(item.size ?? item.tamanho ?? "");
+    const quantidade = Number(item.quantity ?? item.quantidade);
 
     if (
-      !Number.isSafeInteger(id) ||
-      !Object.prototype.hasOwnProperty.call(
-        PRODUTOS,
-        id
-      ) ||
-      !/^\d{2}$/.test(tamanho) ||
-      Number(tamanho) < 34 ||
-      Number(tamanho) > 44 ||
-      !Number.isSafeInteger(quantidade) ||
+      !Number.isInteger(id) ||
+      !PRODUTOS[id] ||
+      !/^(3[4-9]|4[0-4])$/.test(tamanho) ||
+      !Number.isInteger(quantidade) ||
       quantidade < 1 ||
       quantidade > 5
     ) {
-      return {
-        erro:
-          "Produto, tamanho ou quantidade invalida"
-      };
+      throw new Error("Produto, tamanho ou quantidade invalida.");
     }
 
-    const chave = `${id}-${tamanho}`;
+    const chave = id + ":" + tamanho;
 
-    const anterior =
-      agrupados.get(chave)?.quantidade || 0;
+    const anterior = agrupados.get(chave);
 
-    const acumulado =
-      anterior + quantidade;
+    if (anterior) {
+      anterior.quantidade += quantidade;
 
-    if (acumulado > 5) {
-      return {
-        erro:
-          "Limite de 5 unidades por tamanho"
-      };
+      if (anterior.quantidade > 5) {
+        throw new Error("Quantidade maxima por tamanho excedida.");
+      }
+    } else {
+      agrupados.set(chave, {
+        id,
+        tamanho,
+        quantidade,
+        nome: PRODUTOS[id].nome,
+        preco: PRODUTOS[id].preco
+      });
     }
-
-    agrupados.set(chave, {
-      id,
-      tamanho,
-      quantidade: acumulado
-    });
   }
 
-  return {
-    produtos: [...agrupados.values()]
-  };
+  return [...agrupados.values()];
 }
 
-async function verificarEstoque(DB, produtos) {
-  for (const item of produtos) {
-    const registro = await DB.prepare(`
-      SELECT quantidade
-      FROM estoque
-      WHERE produto_id = ?
-        AND tamanho = ?
-    `).bind(
-      item.id,
-      item.tamanho
-    ).first();
+async function validarTurnstile(token, env, ip) {
+  if (
+    typeof token !== "string" ||
+    !token ||
+    !env.TURNSTILE_SECRET_KEY
+  ) {
+    return false;
+  }
 
-    const quantidade = Number(
-      registro?.quantidade
+  const form = new FormData();
+
+  form.append("secret", env.TURNSTILE_SECRET_KEY);
+  form.append("response", token);
+
+  if (ip) {
+    form.append("remoteip", ip);
+  }
+
+  const resposta = await fetch(TURNSTILE_API, {
+    method: "POST",
+    body: form
+  });
+
+  if (!resposta.ok) {
+    return false;
+  }
+
+  const resultado = await resposta.json();
+
+  return (
+    resultado.success === true &&
+    resultado.hostname === "urban-kicks.pages.dev"
+  );
+}
+
+async function verificarEstoque(db, itens) {
+  for (const item of itens) {
+    const registro = await db
+      .prepare(
+        `SELECT COALESCE(SUM(quantidade), 0) AS disponivel
+         FROM estoque
+         WHERE produto_id = ? AND tamanho = ?`
+      )
+      .bind(item.id, item.tamanho)
+      .first();
+
+    if (Number(registro?.disponivel || 0) < item.quantidade) {
+      throw new Error(
+        "Estoque insuficiente para " +
+        item.nome +
+        " tamanho " +
+        item.tamanho
+      );
+    }
+  }
+}
+
+function prepararPagamento(dados, valor) {
+  const tipo = String(
+    dados.metodo ?? dados.paymentMethod ?? "pix"
+  ).toLowerCase();
+
+  if (tipo === "pix") {
+    return {
+      tipo: "pix",
+      pagamento: {
+        amount: valor,
+        payment_method: {
+          id: "pix",
+          type: "bank_transfer"
+        }
+      }
+    };
+  }
+
+  if (tipo === "cartao" || tipo === "credit_card") {
+    const cartao = dados.cartao || {};
+
+    const token = String(cartao.token || "");
+    const bandeira = String(
+      cartao.paymentMethodId || cartao.payment_method_id || ""
+    ).toLowerCase();
+
+    const parcelas = Number(
+      cartao.installments ?? cartao.parcelas
     );
 
     if (
-      !registro ||
-      !Number.isSafeInteger(quantidade) ||
-      quantidade < item.quantidade
+      !/^[a-zA-Z0-9_-]{8,256}$/.test(token) ||
+      !/^[a-z0-9_-]{2,40}$/.test(bandeira) ||
+      !Number.isInteger(parcelas) ||
+      parcelas < 1 ||
+      parcelas > 12
     ) {
-      return {
-        disponivel: false,
-        produtoId: item.id,
-        tamanho: item.tamanho
-      };
+      throw new Error(
+        "Dados de pagamento do cartao invalidos."
+      );
     }
+
+    return {
+      tipo: "credit_card",
+      pagamento: {
+        amount: valor,
+        payment_method: {
+          id: bandeira,
+          type: "credit_card",
+          token,
+          installments: parcelas
+        }
+      }
+    };
   }
 
-  return {
-    disponivel: true
-  };
-}
-
-async function registrarPedido(
-  DB,
-  referencia,
-  totalCentavos,
-  produtos
-) {
-  const comandos = [
-    DB.prepare(`
-      INSERT INTO pedidos (
-        referencia,
-        checkout_id,
-        status,
-        valor_total,
-        ambiente
-      )
-      VALUES (
-        ?,
-        NULL,
-        'PREPARANDO',
-        ?,
-        ?
-      )
-    `).bind(
-      referencia,
-      totalCentavos,
-      AMBIENTE
-    )
-  ];
-
-  for (const item of produtos) {
-    comandos.push(
-      DB.prepare(`
-        INSERT INTO pedido_itens (
-          pedido_id,
-          produto_id,
-          produto_nome,
-          tamanho,
-          quantidade,
-          preco_unitario
-        )
-        SELECT
-          id,
-          ?,
-          ?,
-          ?,
-          ?,
-          ?
-        FROM pedidos
-        WHERE referencia = ?
-          AND ambiente = ?
-      `).bind(
-        item.id,
-        PRODUTOS[item.id].nome,
-        item.tamanho,
-        item.quantidade,
-        PRODUTOS[item.id].valor,
-        referencia,
-        AMBIENTE
-      )
-    );
-  }
-
-  await DB.batch(comandos);
-}
-
-async function atualizarPedido(
-  DB,
-  referencia,
-  orderId
-) {
-  const resultado = await DB.prepare(`
-    UPDATE pedidos
-    SET
-      checkout_id = ?,
-      status = 'PENDENTE',
-      atualizado_em = CURRENT_TIMESTAMP
-    WHERE referencia = ?
-      AND ambiente = ?
-      AND status = 'PREPARANDO'
-      AND checkout_id IS NULL
-  `).bind(
-    orderId,
-    referencia,
-    AMBIENTE
-  ).run();
-
-  return resultado.meta?.changes === 1;
+  throw new Error("Forma de pagamento nao permitida.");
 }
 
 function extrairPix(ordem) {
-  const pagamento =
-    ordem?.transactions?.payments?.[0];
-
-  const metodo =
-    pagamento?.payment_method || {};
-
-  const dados =
-    metodo?.transaction_data || {};
-
-  const obter = (...valores) => {
-    for (const valor of valores) {
-      if (
-        typeof valor === "string" &&
-        valor.length > 0
-      ) {
-        return valor;
-      }
-    }
-
-    return null;
-  };
-
-  const ticket = obter(
-    metodo.ticket_url,
-    dados.ticket_url
-  );
-
-  let ticketUrl = null;
-
-  if (ticket) {
-    try {
-      const url = new URL(ticket);
-
-      if (
-        url.protocol === "https:" &&
-        (
-          url.hostname ===
-            "mercadopago.com.br" ||
-          url.hostname.endsWith(
-            ".mercadopago.com.br"
-          )
-        )
-      ) {
-        ticketUrl = url.href;
-      }
-    } catch {
-      ticketUrl = null;
-    }
-  }
+  const pagamento = ordem?.transactions?.payments?.[0] || {};
+  const metodo = pagamento.payment_method || {};
+  const transacao = pagamento.transaction_data || {};
 
   return {
-    copiaECola: obter(
-      metodo.qr_code,
-      dados.qr_code
-    ),
-    qrCodeBase64: obter(
-      metodo.qr_code_base64,
-      dados.qr_code_base64
-    ),
-    ticketUrl
+    copiaECola:
+      metodo.qr_code ||
+      transacao.qr_code ||
+      null,
+
+    qrCodeBase64:
+      metodo.qr_code_base64 ||
+      transacao.qr_code_base64 ||
+      null,
+
+    ticketUrl:
+      metodo.ticket_url ||
+      transacao.ticket_url ||
+      null
   };
 }
 
-export async function onRequestPost({
-  request,
-  env
-}) {
-  if (
-    !env.DB ||
-    !env.MERCADOPAGO_ACCESS_TOKEN ||
-    !env.TURNSTILE_SECRET_KEY
-  ) {
-    return responder({
-      erro: "Configuracao incompleta"
-    }, 503);
-  }
+export async function onRequestPost(context) {
+  const { request, env } = context;
 
-  let entrada;
-
-  try {
-    entrada = await request.json();
-  } catch {
-    return responder({
-      erro: "JSON invalido"
-    }, 400);
-  }
-
-  if (
-    !entrada ||
-    typeof entrada !== "object"
-  ) {
-    return responder({
-      erro: "Requisicao invalida"
-    }, 400);
-  }
-
-  const validacao = validarCarrinho(
-    entrada.items
-  );
-
-  if (validacao.erro) {
-    return responder({
-      erro: validacao.erro
-    }, 400);
-  }
-
-  const email =
-    typeof entrada.email === "string"
-      ? entrada.email.trim()
-      : "";
-
-  if (
-    email.length > 254 ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-  ) {
-    return responder({
-      erro: "Informe um e-mail valido"
-    }, 400);
-  }
-
-  const seguro = await validarTurnstile(
-    entrada.turnstileToken,
-    request,
-    env
-  );
-
-  if (!seguro) {
-    return responder({
-      erro:
-        "Verificacao de seguranca invalida"
-    }, 403);
-  }
-
-  const produtos = validacao.produtos;
-
-  try {
-    const estoque = await verificarEstoque(
-      env.DB,
-      produtos
+  if (!env.DB || !env.MERCADOPAGO_ACCESS_TOKEN) {
+    return responder(
+      { erro: "Configuracao de pagamento indisponivel." },
+      503
     );
+  }
 
-    if (!estoque.disponivel) {
-      return responder({
-        erro: "Estoque insuficiente",
-        produtoId: estoque.produtoId,
-        tamanho: estoque.tamanho
-      }, 409);
+  let dados;
+  let itens;
+  let tipoPagamento;
+
+  try {
+    const contentType =
+      request.headers.get("content-type") || "";
+
+    if (!contentType.includes("application/json")) {
+      return responder(
+        { erro: "Envie os dados em JSON." },
+        415
+      );
     }
-  } catch (erro) {
-    console.error(
-      "MP_ESTOQUE",
-      String(erro)
-    );
 
-    return responder({
-      erro:
-        "Nao foi possivel consultar estoque"
-    }, 503);
-  }
+    dados = await request.json();
 
-  const totalCentavos = produtos.reduce(
-    (total, item) =>
-      total +
-      PRODUTOS[item.id].valor *
-        item.quantidade,
-    0
-  );
-
-  if (
-    !Number.isSafeInteger(totalCentavos) ||
-    totalCentavos <= 0
-  ) {
-    return responder({
-      erro: "Valor total invalido"
-    }, 400);
-  }
-
-  const valor =
-    (totalCentavos / 100).toFixed(2);
-
-  const identificador = crypto.randomUUID();
-
-  const referencia =
-    PREFIXO + identificador;
-
-  /*
-   * A chave de idempotencia e estavel
-   * durante esta tentativa de checkout.
-   * Nao garante deduplicacao entre
-   * requisicoes diferentes.
-   */
-
-  const chaveIdempotencia =
-    identificador;
-
-  try {
-    await registrarPedido(
-      env.DB,
-      referencia,
-      totalCentavos,
-      produtos
-    );
-  } catch (erro) {
-    console.error(
-      "MP_REGISTRAR_PEDIDO",
-      String(erro)
-    );
-
-    return responder({
-      erro: "Falha ao registrar pedido"
-    }, 503);
-  }
-
-  const corpo = {
-    type: "online",
-    processing_mode: "automatic",
-    external_reference: referencia,
-    total_amount: valor,
-    payer: {
-      email
-    },
-    transactions: {
-      payments: [
-        {
-          amount: valor,
-          payment_method: {
-            id: "pix",
-            type: "bank_transfer"
-          }
-        }
-      ]
+    if (!emailValido(dados.email)) {
+      return responder(
+        { erro: "Informe um e-mail valido." },
+        400
+      );
     }
-  };
 
-  let ordem;
+    itens = normalizarItens(dados.items);
 
-  try {
-    const resposta = await fetch(
-      MP_API,
-      {
+    const totalCentavos = itens.reduce(
+      (total, item) =>
+        total + item.preco * item.quantidade,
+      0
+    );
+
+    if (
+      !Number.isSafeInteger(totalCentavos) ||
+      totalCentavos <= 0
+    ) {
+      return responder(
+        { erro: "Valor do pedido invalido." },
+        400
+      );
+    }
+
+    tipoPagamento = prepararPagamento(
+      dados,
+      dinheiro(totalCentavos)
+    );
+
+    const ip = request.headers.get("CF-Connecting-IP");
+
+    const turnstileValido = await validarTurnstile(
+      dados.turnstileToken,
+      env,
+      ip
+    );
+
+    if (!turnstileValido) {
+      return responder(
+        { erro: "Verificacao de seguranca invalida ou expirada." },
+        403
+      );
+    }
+
+    await verificarEstoque(env.DB, itens);
+
+    const referencia = "UK-MP-" + crypto.randomUUID();
+
+    /*
+     * Cria o pedido interno ANTES de chamar
+     * o Mercado Pago.
+     *
+     * PREPARANDO nao representa pagamento aprovado.
+     */
+
+    const comandos = [
+      env.DB.prepare(
+        `INSERT INTO pedidos
+          (referencia, checkout_id, status, valor_total, ambiente)
+         VALUES (?, NULL, 'PREPARANDO', ?, 'SANDBOX')`
+      ).bind(referencia, totalCentavos)
+    ];
+
+    for (const item of itens) {
+      comandos.push(
+        env.DB.prepare(
+          `INSERT INTO pedido_itens
+           (pedido_id, produto_id, produto_nome,
+            tamanho, quantidade, preco_unitario)
+           SELECT id, ?, ?, ?, ?, ?
+           FROM pedidos
+           WHERE referencia = ?`
+        ).bind(
+          item.id,
+          item.nome,
+          item.tamanho,
+          item.quantidade,
+          item.preco,
+          referencia
+        )
+      );
+    }
+
+    await env.DB.batch(comandos);
+
+    const corpoMP = {
+      type: "online",
+      processing_mode: "automatic",
+      external_reference: referencia,
+      total_amount: dinheiro(totalCentavos),
+      payer: {
+        email: dados.email.trim()
+      },
+      transactions: {
+        payments: [tipoPagamento.pagamento]
+      }
+    };
+
+    /*
+     * A chave de idempotencia e unica
+     * para esta tentativa de criacao.
+     */
+
+    const idempotencyKey = crypto.randomUUID();
+
+    let respostaMP;
+
+    try {
+      respostaMP = await fetch(MP_API, {
         method: "POST",
         headers: {
           Authorization:
-            "Bearer " +
-            env.MERCADOPAGO_ACCESS_TOKEN,
-          "Content-Type":
-            "application/json",
-          Accept: "application/json",
-          "X-Idempotency-Key":
-            chaveIdempotencia
+            "Bearer " + env.MERCADOPAGO_ACCESS_TOKEN,
+          "Content-Type": "application/json",
+          "X-Idempotency-Key": idempotencyKey
         },
-        body: JSON.stringify(corpo),
-        signal: AbortSignal.timeout(20000)
-      }
-    );
-
-    ordem = await resposta.json().catch(
-      () => ({})
-    );
-
-    if (!resposta.ok) {
+        body: JSON.stringify(corpoMP)
+      });
+    } catch (erro) {
       console.error(
-        "MP_ORDER_HTTP",
-        JSON.stringify({
-          status: resposta.status,
-          codigo:
-            ordem?.error ||
-            ordem?.code ||
-            null
-        })
+        "MP_ERRO_CONEXAO",
+        erro?.message || "Falha de rede"
       );
 
-      return responder({
-        erro:
-          "Mercado Pago recusou a Order",
-        referencia,
-        statusMercadoPago:
-          resposta.status
-      }, 502);
+      return responder(
+        {
+          erro: "Nao foi possivel confirmar a criacao do pagamento.",
+          referencia,
+          mensagem:
+            "Nao tente pagar novamente antes de verificar o pedido."
+        },
+        502
+      );
     }
-  } catch (erro) {
-    console.error(
-      "MP_ORDER_REDE",
-      String(erro)
-    );
 
-    return responder({
-      erro:
-        "Falha de comunicacao com Mercado Pago",
-      referencia,
-      mensagem:
-        "Nao tente pagar novamente sem verificar o pedido."
-    }, 502);
-  }
+    const ordem = await respostaMP.json().catch(() => ({}));
 
-  const orderId = ordem?.id;
+    if (!respostaMP.ok) {
+      console.error(
+        "MP_ERRO_API",
+        respostaMP.status,
+        ordem.error || ordem.code || "Erro nao especificado"
+      );
 
-  if (!identificadorValido(orderId)) {
-    console.error(
-      "MP_ORDER_ID_INVALIDO"
-    );
+      return responder(
+        {
+          erro: "Mercado Pago nao aceitou a solicitacao.",
+          referencia,
+          codigo: respostaMP.status
+        },
+        502
+      );
+    }
 
-    return responder({
-      erro:
-        "Identificador da Order invalido",
-      referencia
-    }, 502);
-  }
+    const orderId = String(ordem.id || "");
 
-  if (
-    ordem.external_reference !==
-    referencia
-  ) {
-    return responder({
-      erro:
-        "Referencia da Order divergente",
-      referencia
-    }, 502);
-  }
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(orderId)) {
+      console.error("MP_ORDER_ID_INVALIDO");
 
-  try {
-    const atualizado =
-      await atualizarPedido(
-        env.DB,
+      return responder(
+        {
+          erro: "Resposta inesperada do Mercado Pago.",
+          referencia
+        },
+        502
+      );
+    }
+
+    if (
+      ordem.external_reference &&
+      ordem.external_reference !== referencia
+    ) {
+      console.error("MP_REFERENCIA_DIVERGENTE");
+
+      return responder(
+        {
+          erro: "Divergencia na referencia do pagamento.",
+          referencia
+        },
+        502
+      );
+    }
+
+    /*
+     * Vincula a order ao pedido interno.
+     *
+     * Nenhum estoque e descontado aqui.
+     */
+
+    const atualizacao = await env.DB.prepare(
+      `UPDATE pedidos
+       SET checkout_id = ?,
+           status = 'PENDENTE',
+           atualizado_em = CURRENT_TIMESTAMP
+       WHERE referencia = ?
+         AND ambiente = 'SANDBOX'
+         AND status = 'PREPARANDO'
+         AND checkout_id IS NULL`
+    ).bind(orderId, referencia).run();
+
+    if (atualizacao.meta?.changes !== 1) {
+      console.error(
+        "MP_FALHA_VINCULO_PEDIDO",
         referencia,
         orderId
       );
 
-    if (!atualizado) {
-      throw new Error(
-        "Pedido nao atualizado"
+      return responder(
+        {
+          erro: "Pagamento criado, mas pedido requer verificacao.",
+          referencia,
+          mensagem:
+            "Nao repita a cobranca automaticamente."
+        },
+        503
       );
     }
-  } catch (erro) {
-    console.error(
-      "MP_SALVAR_ORDER",
-      String(erro)
-    );
 
-    return responder({
-      erro:
-        "Order criada, mas nao registrada corretamente",
-      referencia,
-      mensagem:
-        "Nao efetue pagamento. Contate a loja."
-    }, 503);
-  }
+    const statusMP = String(ordem.status || "unknown");
+    const detalheMP = String(ordem.status_detail || "");
 
-  const pix = extrairPix(ordem);
+    const pagamentoRetornado =
+      ordem.transactions?.payments?.[0] || {};
 
-  if (
-    !pix.copiaECola &&
-    !pix.qrCodeBase64 &&
-    !pix.ticketUrl
-  ) {
-    console.error(
-      "MP_PIX_DADOS_AUSENTES",
-      {
-        referencia,
-        orderId
-      }
-    );
-
-    return responder({
-      erro:
-        "Order criada, mas dados PIX indisponiveis",
+    const resultado = {
       referencia,
       orderId,
-      mensagem:
-        "Nao efetue pagamento. Verifique a integracao."
-    }, 502);
-  }
+      ambiente: "SANDBOX",
+      metodo: tipoPagamento.tipo,
+      status: "PENDENTE",
+      statusMercadoPago: statusMP,
+      detalheMercadoPago: detalheMP,
+      valorTotal: dinheiro(totalCentavos),
+      pagamentoId:
+        pagamentoRetornado.id || null
+    };
 
-  return responder({
-    referencia,
-    orderId,
-    ambiente: AMBIENTE,
-    status: "PENDENTE",
-    statusMercadoPago:
-      ordem.status || null,
-    valorTotal: totalCentavos,
-    pix,
-    mensagem:
-      "Pagamento nao confirmado. Aguarde a conciliacao."
-  });
+    if (tipoPagamento.tipo === "pix") {
+      resultado.pix = extrairPix(ordem);
+    }
+
+    /*
+     * Mesmo que a API retorne processed,
+     * a confirmacao definitiva e feita
+     * pelo backend de conciliacao/webhook.
+     */
+
+    resultado.mensagem =
+      "Pagamento registrado. Aguarde confirmacao.";
+
+    return responder(resultado, 200);
+
+  } catch (erro) {
+    console.error(
+      "MP_CHECKOUT_ERRO",
+      erro?.message || "Erro inesperado"
+    );
+
+    const mensagem = String(erro?.message || "");
+
+    if (
+      mensagem.includes("Carrinho invalido") ||
+      mensagem.includes("Produto, tamanho") ||
+      mensagem.includes("Quantidade maxima") ||
+      mensagem.includes("Dados de pagamento") ||
+      mensagem.includes("Forma de pagamento") ||
+      mensagem.includes("Valor do pedido")
+    ) {
+      return responder({ erro: mensagem }, 400);
+    }
+
+    if (mensagem.includes("Estoque insuficiente")) {
+      return responder({ erro: mensagem }, 409);
+    }
+
+    return responder(
+      { erro: "Nao foi possivel processar o checkout." },
+      500
+    );
+  }
 }
 
-export function onRequestGet() {
-  return responder({
-    erro:
-      "Metodo nao permitido. Utilize POST."
-  }, 405);
+export async function onRequestGet() {
+  return responder(
+    { erro: "Metodo nao permitido. Utilize POST." },
+    405
+  );
 }

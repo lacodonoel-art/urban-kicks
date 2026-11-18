@@ -1,30 +1,61 @@
 
 /*
  * URBAN KICKS
- * Mercado Pago - Checkout PIX
+ * MERCADO PAGO - CHECKOUT PIX
  * Cloudflare Pages Functions + D1
  *
- * POST /api/checkout-mercadopago
+ * Rota: POST /api/checkout-mercadopago
  *
- * Ambiente de teste.
- * Nao altera os arquivos do PagBank.
- * Nao desconta estoque antes da confirmacao.
+ * Ambiente: SANDBOX
+ * Pedidos identificados por UK-MP-
+ *
+ * Nao modifica o PagBank.
+ * Nao confirma pagamentos.
+ * Nao desconta estoque.
  */
 
-const MP_API = "https://api.mercadopago.com/v1/orders";
+const MP_API =
+  "https://api.mercadopago.com/v1/orders";
 
 const TURNSTILE_API =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
+const AMBIENTE = "SANDBOX";
+const PREFIXO = "UK-MP-";
+
 const PRODUTOS = {
-  1: { nome: "New Balance — Cinza Urbano", valor: 39990 },
-  2: { nome: "Nike TN — Edição Iridescente", valor: 44990 },
-  3: { nome: "Nike Air Max Plus — Preto e Prata", valor: 42990 },
-  4: { nome: "Nike Shox — Total Black", valor: 49990 },
-  5: { nome: "Nike Air Max Plus — Blue Gradient", valor: 44990 },
-  6: { nome: "Nike Shox — Marrom Escuro", valor: 48990 },
-  7: { nome: "Nike P-6000 — Branco", valor: 37990 },
-  8: { nome: "Nike P-6000 — Branco Lateral", valor: 37990 }
+  1: {
+    nome: "New Balance — Cinza Urbano",
+    valor: 39990
+  },
+  2: {
+    nome: "Nike TN — Edição Iridescente",
+    valor: 44990
+  },
+  3: {
+    nome: "Nike Air Max Plus — Preto e Prata",
+    valor: 42990
+  },
+  4: {
+    nome: "Nike Shox — Total Black",
+    valor: 49990
+  },
+  5: {
+    nome: "Nike Air Max Plus — Blue Gradient",
+    valor: 44990
+  },
+  6: {
+    nome: "Nike Shox — Marrom Escuro",
+    valor: 48990
+  },
+  7: {
+    nome: "Nike P-6000 — Branco",
+    valor: 37990
+  },
+  8: {
+    nome: "Nike P-6000 — Branco Lateral",
+    valor: 37990
+  }
 };
 
 function responder(dados, status = 200) {
@@ -36,7 +67,20 @@ function responder(dados, status = 200) {
   });
 }
 
-async function validarTurnstile(token, request, env) {
+function identificadorValido(valor) {
+  return (
+    typeof valor === "string" &&
+    valor.length >= 1 &&
+    valor.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(valor)
+  );
+}
+
+async function validarTurnstile(
+  token,
+  request,
+  env
+) {
   if (
     typeof token !== "string" ||
     token.length < 1 ||
@@ -47,21 +91,33 @@ async function validarTurnstile(token, request, env) {
 
   const formulario = new FormData();
 
-  formulario.append("secret", env.TURNSTILE_SECRET_KEY);
-  formulario.append("response", token);
+  formulario.append(
+    "secret",
+    env.TURNSTILE_SECRET_KEY
+  );
 
-  const ip = request.headers.get("CF-Connecting-IP");
+  formulario.append(
+    "response",
+    token
+  );
+
+  const ip = request.headers.get(
+    "CF-Connecting-IP"
+  );
 
   if (ip) {
     formulario.append("remoteip", ip);
   }
 
   try {
-    const resposta = await fetch(TURNSTILE_API, {
-      method: "POST",
-      body: formulario,
-      signal: AbortSignal.timeout(10000)
-    });
+    const resposta = await fetch(
+      TURNSTILE_API,
+      {
+        method: "POST",
+        body: formulario,
+        signal: AbortSignal.timeout(10000)
+      }
+    );
 
     if (!resposta.ok) {
       return false;
@@ -71,16 +127,83 @@ async function validarTurnstile(token, request, env) {
 
     return (
       dados.success === true &&
-      dados.hostname === "urban-kicks.pages.dev"
+      dados.hostname ===
+        "urban-kicks.pages.dev"
     );
   } catch (erro) {
     console.error(
-      "TURNSTILE_ERRO",
+      "MP_TURNSTILE",
       String(erro)
     );
 
     return false;
   }
+}
+
+function validarCarrinho(items) {
+  if (
+    !Array.isArray(items) ||
+    items.length < 1 ||
+    items.length > 20
+  ) {
+    return {
+      erro: "Carrinho invalido"
+    };
+  }
+
+  const agrupados = new Map();
+
+  for (const item of items) {
+    const id = item?.id;
+    const tamanho = String(
+      item?.size ?? ""
+    );
+    const quantidade = item?.quantity;
+
+    if (
+      !Number.isSafeInteger(id) ||
+      !Object.prototype.hasOwnProperty.call(
+        PRODUTOS,
+        id
+      ) ||
+      !/^\d{2}$/.test(tamanho) ||
+      Number(tamanho) < 34 ||
+      Number(tamanho) > 44 ||
+      !Number.isSafeInteger(quantidade) ||
+      quantidade < 1 ||
+      quantidade > 5
+    ) {
+      return {
+        erro:
+          "Produto, tamanho ou quantidade invalida"
+      };
+    }
+
+    const chave = `${id}-${tamanho}`;
+
+    const anterior =
+      agrupados.get(chave)?.quantidade || 0;
+
+    const acumulado =
+      anterior + quantidade;
+
+    if (acumulado > 5) {
+      return {
+        erro:
+          "Limite de 5 unidades por tamanho"
+      };
+    }
+
+    agrupados.set(chave, {
+      id,
+      tamanho,
+      quantidade: acumulado
+    });
+  }
+
+  return {
+    produtos: [...agrupados.values()]
+  };
 }
 
 async function verificarEstoque(DB, produtos) {
@@ -89,16 +212,20 @@ async function verificarEstoque(DB, produtos) {
       SELECT quantidade
       FROM estoque
       WHERE produto_id = ?
-        AND CAST(tamanho AS TEXT) = ?
+        AND tamanho = ?
     `).bind(
       item.id,
       item.tamanho
     ).first();
 
+    const quantidade = Number(
+      registro?.quantidade
+    );
+
     if (
       !registro ||
-      !Number.isSafeInteger(Number(registro.quantidade)) ||
-      Number(registro.quantidade) < item.quantidade
+      !Number.isSafeInteger(quantidade) ||
+      quantidade < item.quantidade
     ) {
       return {
         disponivel: false,
@@ -113,16 +240,163 @@ async function verificarEstoque(DB, produtos) {
   };
 }
 
-function validarOrderId(id) {
-  return (
-    typeof id === "string" &&
-    id.length >= 1 &&
-    id.length <= 128 &&
-    /^[A-Za-z0-9_-]+$/.test(id)
-  );
+async function registrarPedido(
+  DB,
+  referencia,
+  totalCentavos,
+  produtos
+) {
+  const comandos = [
+    DB.prepare(`
+      INSERT INTO pedidos (
+        referencia,
+        checkout_id,
+        status,
+        valor_total,
+        ambiente
+      )
+      VALUES (
+        ?,
+        NULL,
+        'PREPARANDO',
+        ?,
+        ?
+      )
+    `).bind(
+      referencia,
+      totalCentavos,
+      AMBIENTE
+    )
+  ];
+
+  for (const item of produtos) {
+    comandos.push(
+      DB.prepare(`
+        INSERT INTO pedido_itens (
+          pedido_id,
+          produto_id,
+          produto_nome,
+          tamanho,
+          quantidade,
+          preco_unitario
+        )
+        SELECT
+          id,
+          ?,
+          ?,
+          ?,
+          ?,
+          ?
+        FROM pedidos
+        WHERE referencia = ?
+          AND ambiente = ?
+      `).bind(
+        item.id,
+        PRODUTOS[item.id].nome,
+        item.tamanho,
+        item.quantidade,
+        PRODUTOS[item.id].valor,
+        referencia,
+        AMBIENTE
+      )
+    );
+  }
+
+  await DB.batch(comandos);
 }
 
-export async function onRequestPost({ request, env }) {
+async function atualizarPedido(
+  DB,
+  referencia,
+  orderId
+) {
+  const resultado = await DB.prepare(`
+    UPDATE pedidos
+    SET
+      checkout_id = ?,
+      status = 'PENDENTE',
+      atualizado_em = CURRENT_TIMESTAMP
+    WHERE referencia = ?
+      AND ambiente = ?
+      AND status = 'PREPARANDO'
+      AND checkout_id IS NULL
+  `).bind(
+    orderId,
+    referencia,
+    AMBIENTE
+  ).run();
+
+  return resultado.meta?.changes === 1;
+}
+
+function extrairPix(ordem) {
+  const pagamento =
+    ordem?.transactions?.payments?.[0];
+
+  const metodo =
+    pagamento?.payment_method || {};
+
+  const dados =
+    metodo?.transaction_data || {};
+
+  const obter = (...valores) => {
+    for (const valor of valores) {
+      if (
+        typeof valor === "string" &&
+        valor.length > 0
+      ) {
+        return valor;
+      }
+    }
+
+    return null;
+  };
+
+  const ticket = obter(
+    metodo.ticket_url,
+    dados.ticket_url
+  );
+
+  let ticketUrl = null;
+
+  if (ticket) {
+    try {
+      const url = new URL(ticket);
+
+      if (
+        url.protocol === "https:" &&
+        (
+          url.hostname ===
+            "mercadopago.com.br" ||
+          url.hostname.endsWith(
+            ".mercadopago.com.br"
+          )
+        )
+      ) {
+        ticketUrl = url.href;
+      }
+    } catch {
+      ticketUrl = null;
+    }
+  }
+
+  return {
+    copiaECola: obter(
+      metodo.qr_code,
+      dados.qr_code
+    ),
+    qrCodeBase64: obter(
+      metodo.qr_code_base64,
+      dados.qr_code_base64
+    ),
+    ticketUrl
+  };
+}
+
+export async function onRequestPost({
+  request,
+  env
+}) {
   if (
     !env.DB ||
     !env.MERCADOPAGO_ACCESS_TOKEN ||
@@ -145,12 +419,34 @@ export async function onRequestPost({ request, env }) {
 
   if (
     !entrada ||
-    !Array.isArray(entrada.items) ||
-    entrada.items.length < 1 ||
-    entrada.items.length > 20
+    typeof entrada !== "object"
   ) {
     return responder({
-      erro: "Carrinho invalido"
+      erro: "Requisicao invalida"
+    }, 400);
+  }
+
+  const validacao = validarCarrinho(
+    entrada.items
+  );
+
+  if (validacao.erro) {
+    return responder({
+      erro: validacao.erro
+    }, 400);
+  }
+
+  const email =
+    typeof entrada.email === "string"
+      ? entrada.email.trim()
+      : "";
+
+  if (
+    email.length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  ) {
+    return responder({
+      erro: "Informe um e-mail valido"
     }, 400);
   }
 
@@ -162,74 +458,12 @@ export async function onRequestPost({ request, env }) {
 
   if (!seguro) {
     return responder({
-      erro: "Verificacao de seguranca invalida"
+      erro:
+        "Verificacao de seguranca invalida"
     }, 403);
   }
 
-  const email = String(
-    entrada.email || ""
-  ).trim();
-
-  if (
-    email.length > 254 ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-  ) {
-    return responder({
-      erro: "Informe um e-mail valido"
-    }, 400);
-  }
-
-  const agrupados = new Map();
-
-  for (const item of entrada.items) {
-    const id = item?.id;
-
-    const tamanho = String(
-      item?.size ?? ""
-    );
-
-    const quantidade = item?.quantity;
-
-    if (
-      !Number.isSafeInteger(id) ||
-      !Object.prototype.hasOwnProperty.call(
-        PRODUTOS,
-        id
-      ) ||
-      !/^\d{2}$/.test(tamanho) ||
-      Number(tamanho) < 34 ||
-      Number(tamanho) > 44 ||
-      !Number.isSafeInteger(quantidade) ||
-      quantidade < 1 ||
-      quantidade > 5
-    ) {
-      return responder({
-        erro: "Produto, tamanho ou quantidade invalida"
-      }, 400);
-    }
-
-    const chave = id + "-" + tamanho;
-
-    const acumulado =
-      (agrupados.get(chave)?.quantidade || 0) +
-      quantidade;
-
-    if (acumulado > 5) {
-      return responder({
-        erro: "Limite de 5 unidades por tamanho"
-      }, 400);
-    }
-
-    agrupados.set(chave, {
-      id,
-      tamanho,
-      quantidade: acumulado
-    });
-  }
-
-  const produtos = [
-    ...agrupados.values()
-  ];
+  const produtos = validacao.produtos;
 
   try {
     const estoque = await verificarEstoque(
@@ -246,22 +480,21 @@ export async function onRequestPost({ request, env }) {
     }
   } catch (erro) {
     console.error(
-      "MP_ESTOQUE_ERRO",
+      "MP_ESTOQUE",
       String(erro)
     );
 
     return responder({
-      erro: "Nao foi possivel consultar estoque"
+      erro:
+        "Nao foi possivel consultar estoque"
     }, 503);
   }
 
   const totalCentavos = produtos.reduce(
-    (total, item) => {
-      return (
-        total +
-        PRODUTOS[item.id].valor * item.quantidade
-      );
-    },
+    (total, item) =>
+      total +
+      PRODUTOS[item.id].valor *
+        item.quantidade,
     0
   );
 
@@ -274,77 +507,34 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
-  const valor = (
-    totalCentavos / 100
-  ).toFixed(2);
+  const valor =
+    (totalCentavos / 100).toFixed(2);
+
+  const identificador = crypto.randomUUID();
 
   const referencia =
-    "UK-MP-" + crypto.randomUUID();
+    PREFIXO + identificador;
 
   /*
-   * Registra pedido e itens no D1.
-   * Nenhuma unidade e descontada aqui.
+   * A chave de idempotencia e estavel
+   * durante esta tentativa de checkout.
+   * Nao garante deduplicacao entre
+   * requisicoes diferentes.
    */
 
+  const chaveIdempotencia =
+    identificador;
+
   try {
-    const comandos = [
-      env.DB.prepare(`
-        INSERT INTO pedidos (
-          referencia,
-          checkout_id,
-          status,
-          valor_total,
-          ambiente
-        )
-        VALUES (
-          ?,
-          NULL,
-          'PREPARANDO',
-          ?,
-          'TESTE_MP'
-        )
-      `).bind(
-        referencia,
-        totalCentavos
-      )
-    ];
-
-    for (const item of produtos) {
-      comandos.push(
-        env.DB.prepare(`
-          INSERT INTO pedido_itens (
-            pedido_id,
-            produto_id,
-            produto_nome,
-            tamanho,
-            quantidade,
-            preco_unitario
-          )
-          SELECT
-            id,
-            ?,
-            ?,
-            ?,
-            ?,
-            ?
-          FROM pedidos
-          WHERE referencia = ?
-            AND ambiente = 'TESTE_MP'
-        `).bind(
-          item.id,
-          PRODUTOS[item.id].nome,
-          item.tamanho,
-          item.quantidade,
-          PRODUTOS[item.id].valor,
-          referencia
-        )
-      );
-    }
-
-    await env.DB.batch(comandos);
+    await registrarPedido(
+      env.DB,
+      referencia,
+      totalCentavos,
+      produtos
+    );
   } catch (erro) {
     console.error(
-      "MP_D1_PREPARAR",
+      "MP_REGISTRAR_PEDIDO",
       String(erro)
     );
 
@@ -352,10 +542,6 @@ export async function onRequestPost({ request, env }) {
       erro: "Falha ao registrar pedido"
     }, 503);
   }
-
-  /*
-   * Cria a Order PIX no Mercado Pago.
-   */
 
   const corpo = {
     type: "online",
@@ -381,20 +567,24 @@ export async function onRequestPost({ request, env }) {
   let ordem;
 
   try {
-    const resposta = await fetch(MP_API, {
-      method: "POST",
-      headers: {
-        Authorization:
-          "Bearer " +
-          env.MERCADOPAGO_ACCESS_TOKEN,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "X-Idempotency-Key":
-          crypto.randomUUID()
-      },
-      body: JSON.stringify(corpo),
-      signal: AbortSignal.timeout(20000)
-    });
+    const resposta = await fetch(
+      MP_API,
+      {
+        method: "POST",
+        headers: {
+          Authorization:
+            "Bearer " +
+            env.MERCADOPAGO_ACCESS_TOKEN,
+          "Content-Type":
+            "application/json",
+          Accept: "application/json",
+          "X-Idempotency-Key":
+            chaveIdempotencia
+        },
+        body: JSON.stringify(corpo),
+        signal: AbortSignal.timeout(20000)
+      }
+    );
 
     ordem = await resposta.json().catch(
       () => ({})
@@ -413,9 +603,11 @@ export async function onRequestPost({ request, env }) {
       );
 
       return responder({
-        erro: "Mercado Pago recusou o pagamento",
+        erro:
+          "Mercado Pago recusou a Order",
         referencia,
-        statusMercadoPago: resposta.status
+        statusMercadoPago:
+          resposta.status
       }, 502);
     }
   } catch (erro) {
@@ -425,62 +617,55 @@ export async function onRequestPost({ request, env }) {
     );
 
     return responder({
-      erro: "Falha de comunicacao com Mercado Pago",
+      erro:
+        "Falha de comunicacao com Mercado Pago",
       referencia,
       mensagem:
-        "Verifique o pedido antes de tentar novamente."
+        "Nao tente pagar novamente sem verificar o pedido."
     }, 502);
   }
-
-  /*
-   * Validacao corrigida:
-   * nao exige prefixo ORD.
-   */
 
   const orderId = ordem?.id;
 
-  if (!validarOrderId(orderId)) {
+  if (!identificadorValido(orderId)) {
     console.error(
-      "MP_ORDER_ID_INVALIDO",
-      JSON.stringify({
-        tipo: typeof orderId
-      })
+      "MP_ORDER_ID_INVALIDO"
     );
 
     return responder({
-      erro: "Identificador da order invalido",
+      erro:
+        "Identificador da Order invalido",
       referencia
     }, 502);
   }
 
-  /*
-   * Salva o identificador da Order no D1.
-   */
+  if (
+    ordem.external_reference !==
+    referencia
+  ) {
+    return responder({
+      erro:
+        "Referencia da Order divergente",
+      referencia
+    }, 502);
+  }
 
   try {
-    const salvo = await env.DB.prepare(`
-      UPDATE pedidos
-      SET
-        checkout_id = ?,
-        status = 'PENDENTE',
-        atualizado_em = CURRENT_TIMESTAMP
-      WHERE referencia = ?
-        AND ambiente = 'TESTE_MP'
-        AND status = 'PREPARANDO'
-        AND checkout_id IS NULL
-    `).bind(
-      orderId,
-      referencia
-    ).run();
+    const atualizado =
+      await atualizarPedido(
+        env.DB,
+        referencia,
+        orderId
+      );
 
-    if (salvo.meta?.changes !== 1) {
+    if (!atualizado) {
       throw new Error(
         "Pedido nao atualizado"
       );
     }
   } catch (erro) {
     console.error(
-      "MP_D1_SALVAR",
+      "MP_SALVAR_ORDER",
       String(erro)
     );
 
@@ -489,53 +674,46 @@ export async function onRequestPost({ request, env }) {
         "Order criada, mas nao registrada corretamente",
       referencia,
       mensagem:
-        "Nao efetue o pagamento. Contate a loja."
+        "Nao efetue pagamento. Contate a loja."
     }, 503);
   }
 
-  /*
-   * Extrai os dados do PIX.
-   */
+  const pix = extrairPix(ordem);
 
-  const pagamento =
-    ordem?.transactions?.payments?.[0];
+  if (
+    !pix.copiaECola &&
+    !pix.qrCodeBase64 &&
+    !pix.ticketUrl
+  ) {
+    console.error(
+      "MP_PIX_DADOS_AUSENTES",
+      {
+        referencia,
+        orderId
+      }
+    );
 
-  const metodo =
-    pagamento?.payment_method || {};
-
-  const copiaECola =
-    typeof metodo.qr_code === "string"
-      ? metodo.qr_code
-      : null;
-
-  const qrCodeBase64 =
-    typeof metodo.qr_code_base64 === "string"
-      ? metodo.qr_code_base64
-      : null;
-
-  const ticketUrl =
-    typeof metodo.ticket_url === "string" &&
-    metodo.ticket_url.startsWith(
-      "https://www.mercadopago.com.br/"
-    )
-      ? metodo.ticket_url
-      : null;
+    return responder({
+      erro:
+        "Order criada, mas dados PIX indisponiveis",
+      referencia,
+      orderId,
+      mensagem:
+        "Nao efetue pagamento. Verifique a integracao."
+    }, 502);
+  }
 
   return responder({
     referencia,
     orderId,
-    ambiente: "TESTE_MP",
+    ambiente: AMBIENTE,
     status: "PENDENTE",
     statusMercadoPago:
       ordem.status || null,
     valorTotal: totalCentavos,
-    pix: {
-      copiaECola,
-      qrCodeBase64,
-      ticketUrl
-    },
+    pix,
     mensagem:
-      "Pagamento ainda nao confirmado. Aguarde a conciliacao."
+      "Pagamento nao confirmado. Aguarde a conciliacao."
   });
 }
 

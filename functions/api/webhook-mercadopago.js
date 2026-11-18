@@ -1,22 +1,23 @@
 
 /*
  * URBAN KICKS
- * WEBHOOK MERCADO PAGO - AMBIENTE DE TESTE
+ * WEBHOOK MERCADO PAGO - TESTE
  * Cloudflare Pages Functions + D1
  *
  * POST /api/webhook-mercadopago
  *
- * Valida assinatura HMAC-SHA256.
- * Consulta a order na API oficial.
- * Confere referencia, valor e pagamento.
- * Registra pagamento e desconta estoque
- * em uma operacao atomica no D1.
+ * Verifica assinatura HMAC-SHA256.
+ * Consulta a Order na API oficial.
+ * Confere pedido, moeda, valor e pagamento.
+ * Confirma pedido e desconta estoque no D1.
+ *
+ * Nao altera o webhook do PagBank.
  */
 
 const API = "https://api.mercadopago.com/v1/orders/";
 const LIMITE_CORPO = 100000;
 
-function json(dados, status = 200) {
+function responder(dados, status = 200) {
   return Response.json(dados, {
     status,
     headers: {
@@ -25,7 +26,16 @@ function json(dados, status = 200) {
   });
 }
 
-function compararHex(a, b) {
+function idValido(id) {
+  return (
+    typeof id === "string" &&
+    id.length >= 1 &&
+    id.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(id)
+  );
+}
+
+function compararSeguro(a, b) {
   if (
     typeof a !== "string" ||
     typeof b !== "string" ||
@@ -47,14 +57,11 @@ async function validarAssinatura(request, segredo) {
   const url = new URL(request.url);
 
   const id = url.searchParams.get("data.id");
-  const tipo = url.searchParams.get("type");
   const assinatura = request.headers.get("x-signature");
   const requestId = request.headers.get("x-request-id");
 
   if (
-    tipo !== "order" ||
-    !id ||
-    !/^ORD[A-Za-z0-9_-]{10,100}$/.test(id) ||
+    !idValido(id) ||
     !assinatura ||
     !requestId ||
     requestId.length > 200
@@ -83,8 +90,8 @@ async function validarAssinatura(request, segredo) {
     return null;
   }
 
-  // Tolerancia de 10 minutos contra replay.
   const numeroTs = Number(ts);
+
   const instante = ts.length <= 10
     ? numeroTs * 1000
     : numeroTs;
@@ -112,26 +119,26 @@ async function validarAssinatura(request, segredo) {
     ["sign"]
   );
 
-  const bytes = await crypto.subtle.sign(
+  const assinaturaCalculada = await crypto.subtle.sign(
     "HMAC",
     chave,
     new TextEncoder().encode(manifesto)
   );
 
-  const calculado = Array.from(
-    new Uint8Array(bytes)
+  const hexadecimal = Array.from(
+    new Uint8Array(assinaturaCalculada)
   ).map(
-    b => b.toString(16).padStart(2, "0")
+    byte => byte.toString(16).padStart(2, "0")
   ).join("");
 
-  if (!compararHex(calculado, v1.toLowerCase())) {
+  if (!compararSeguro(hexadecimal, v1.toLowerCase())) {
     return null;
   }
 
   return id;
 }
 
-function centavos(valor) {
+function converterCentavos(valor) {
   const texto = String(valor ?? "");
 
   if (!/^\d{1,12}(\.\d{1,2})?$/.test(texto)) {
@@ -139,6 +146,7 @@ function centavos(valor) {
   }
 
   const [reais, decimais = ""] = texto.split(".");
+
   const resultado =
     Number(reais) * 100 +
     Number(decimais.padEnd(2, "0"));
@@ -163,7 +171,7 @@ async function consultarOrder(id, token) {
 
   if (!resposta.ok) {
     throw new Error(
-      "Consulta Mercado Pago HTTP " + resposta.status
+      "Mercado Pago HTTP " + resposta.status
     );
   }
 
@@ -179,7 +187,9 @@ async function buscarItens(DB, pedido) {
       SUM(quantidade * preco_unitario) AS subtotal
     FROM pedido_itens
     WHERE pedido_id = ?
-    GROUP BY produto_id, CAST(tamanho AS TEXT)
+    GROUP BY
+      produto_id,
+      CAST(tamanho AS TEXT)
   `).bind(pedido.id).all();
 
   const itens = consulta.results || [];
@@ -207,7 +217,7 @@ async function buscarItens(DB, pedido) {
   }
 
   if (total !== pedido.valor_total) {
-    throw new Error("Total dos itens divergente");
+    throw new Error("Valor dos itens divergente");
   }
 
   return itens;
@@ -219,7 +229,7 @@ export async function onRequestPost({ request, env }) {
     !env.MERCADOPAGO_ACCESS_TOKEN ||
     !env.MERCADOPAGO_WEBHOOK_SECRET
   ) {
-    return json({
+    return responder({
       erro: "Configuracao incompleta"
     }, 503);
   }
@@ -232,7 +242,7 @@ export async function onRequestPost({ request, env }) {
     !Number.isFinite(tamanho) ||
     tamanho > LIMITE_CORPO
   ) {
-    return json({
+    return responder({
       erro: "Notificacao muito grande"
     }, 413);
   }
@@ -242,7 +252,7 @@ export async function onRequestPost({ request, env }) {
   try {
     corpo = await request.text();
   } catch {
-    return json({
+    return responder({
       erro: "Falha ao ler notificacao"
     }, 400);
   }
@@ -251,7 +261,7 @@ export async function onRequestPost({ request, env }) {
     !corpo ||
     new TextEncoder().encode(corpo).length > LIMITE_CORPO
   ) {
-    return json({
+    return responder({
       erro: "Corpo invalido"
     }, 400);
   }
@@ -263,14 +273,19 @@ export async function onRequestPost({ request, env }) {
       request,
       env.MERCADOPAGO_WEBHOOK_SECRET
     );
-  } catch {
-    return json({
-      erro: "Falha na verificacao da assinatura"
+  } catch (erro) {
+    console.error(
+      "MP_ASSINATURA_ERRO",
+      String(erro)
+    );
+
+    return responder({
+      erro: "Falha ao validar assinatura"
     }, 503);
   }
 
   if (!orderId) {
-    return json({
+    return responder({
       erro: "Assinatura invalida ou expirada"
     }, 401);
   }
@@ -280,7 +295,7 @@ export async function onRequestPost({ request, env }) {
   try {
     evento = JSON.parse(corpo);
   } catch {
-    return json({
+    return responder({
       erro: "JSON invalido"
     }, 400);
   }
@@ -290,7 +305,7 @@ export async function onRequestPost({ request, env }) {
     evento?.live_mode !== false ||
     evento?.data?.id !== orderId
   ) {
-    return json({
+    return responder({
       erro: "Evento de teste invalido"
     }, 400);
   }
@@ -303,18 +318,21 @@ export async function onRequestPost({ request, env }) {
       env.MERCADOPAGO_ACCESS_TOKEN
     );
   } catch (erro) {
-    console.error("MP_CONSULTA", String(erro));
+    console.error(
+      "MP_CONSULTA_ORDER",
+      String(erro)
+    );
 
-    return json({
-      erro: "Falha ao consultar order"
+    return responder({
+      erro: "Falha ao consultar Order"
     }, 503);
   }
 
   if (
-    order?.id !== orderId ||
+    String(order?.id ?? "") !== orderId ||
     typeof order.external_reference !== "string"
   ) {
-    return json({
+    return responder({
       erro: "Order inconsistente"
     }, 409);
   }
@@ -340,21 +358,24 @@ export async function onRequestPost({ request, env }) {
       orderId
     ).first();
   } catch (erro) {
-    console.error("MP_BUSCAR_PEDIDO", String(erro));
+    console.error(
+      "MP_PEDIDO_D1",
+      String(erro)
+    );
 
-    return json({
+    return responder({
       erro: "Falha ao localizar pedido"
     }, 503);
   }
 
   if (!pedido) {
-    return json({
-      erro: "Pedido de teste nao encontrado"
+    return responder({
+      erro: "Pedido nao encontrado"
     }, 404);
   }
 
   if (pedido.status === "PAGO") {
-    return json({
+    return responder({
       recebido: true,
       pedidoId: pedido.id,
       status: "PAGO",
@@ -364,7 +385,7 @@ export async function onRequestPost({ request, env }) {
   }
 
   if (pedido.status !== "PENDENTE") {
-    return json({
+    return responder({
       recebido: true,
       pedidoId: pedido.id,
       status: pedido.status,
@@ -372,27 +393,27 @@ export async function onRequestPost({ request, env }) {
     });
   }
 
-  const pagamentos = order?.transactions?.payments;
-
   if (
     order.status !== "processed" ||
     order.status_detail !== "accredited"
   ) {
-    return json({
+    return responder({
       recebido: true,
       pedidoId: pedido.id,
+      status: "PENDENTE",
       pagamentoConfirmado: false,
       estoqueAlterado: false
     });
   }
 
-  // Apenas uma transacao paga e aceita
-  // automaticamente nesta integracao.
+  const pagamentos =
+    order?.transactions?.payments;
+
   if (
     !Array.isArray(pagamentos) ||
     pagamentos.length !== 1
   ) {
-    return json({
+    return responder({
       erro: "Transacoes exigem revisao manual",
       processado: false
     }, 409);
@@ -403,49 +424,61 @@ export async function onRequestPost({ request, env }) {
   if (
     pagamento?.status !== "processed" ||
     pagamento?.status_detail !== "accredited" ||
-    typeof pagamento.id !== "string" ||
-    !/^PAY[A-Za-z0-9_-]{10,100}$/.test(pagamento.id)
+    !idValido(String(pagamento?.id ?? ""))
   ) {
-    return json({
+    return responder({
       erro: "Pagamento nao validado",
       processado: false
     }, 409);
   }
 
+  const pagamentoId = String(pagamento.id);
+
   if (
     !Number.isSafeInteger(pedido.valor_total) ||
     pedido.valor_total <= 0 ||
     order.currency_id !== "BRL" ||
-    centavos(order.total_amount) !== pedido.valor_total ||
-    centavos(order.total_paid_amount) !== pedido.valor_total ||
-    centavos(pagamento.amount) !== pedido.valor_total ||
-    centavos(pagamento.paid_amount) !== pedido.valor_total
+    converterCentavos(order.total_amount) !==
+      pedido.valor_total ||
+    converterCentavos(order.total_paid_amount) !==
+      pedido.valor_total ||
+    converterCentavos(pagamento.amount) !==
+      pedido.valor_total ||
+    converterCentavos(pagamento.paid_amount) !==
+      pedido.valor_total
   ) {
-    return json({
+    return responder({
       erro: "Valor ou moeda divergente",
       processado: false
     }, 409);
   }
 
   const metodo =
-    pagamento.payment_method?.type || "desconhecido";
+    pagamento.payment_method?.type ||
+    "desconhecido";
 
   let itens;
 
   try {
     itens = await buscarItens(env.DB, pedido);
   } catch (erro) {
-    console.error("MP_ITENS", String(erro));
+    console.error(
+      "MP_ITENS_D1",
+      String(erro)
+    );
 
-    return json({
+    return responder({
       erro: "Itens do pedido inconsistentes"
     }, 409);
   }
 
   const comandos = [];
 
-  // UNIQUE(pedido_id) na tabela de pagamentos
-  // protege contra confirmacao duplicada.
+  /*
+   * UNIQUE(pedido_id) impede registrar
+   * o mesmo pedido duas vezes.
+   */
+
   comandos.push(env.DB.prepare(`
     INSERT INTO pagamentos_mercadopago (
       pedido_id,
@@ -460,34 +493,43 @@ export async function onRequestPost({ request, env }) {
   `).bind(
     pedido.id,
     orderId,
-    pagamento.id,
+    pagamentoId,
     pedido.valor_total,
     metodo
   ));
 
-  // Falha a transacao se o pedido ja mudou
-  // de estado antes da atualizacao.
+  /*
+   * Se o status mudou antes da confirmacao,
+   * a transacao falha.
+   */
+
   comandos.push(env.DB.prepare(`
     UPDATE pedidos
-    SET status = CASE
-          WHEN status = 'PENDENTE' THEN 'PAGO'
-          ELSE NULL
-        END,
-        atualizado_em = CURRENT_TIMESTAMP
+    SET
+      status = CASE
+        WHEN status = 'PENDENTE'
+        THEN 'PAGO'
+        ELSE NULL
+      END,
+      atualizado_em = CURRENT_TIMESTAMP
     WHERE id = ?
       AND ambiente = 'TESTE_MP'
   `).bind(pedido.id));
 
+  /*
+   * Desconta o estoque por produto e tamanho.
+   */
+
   for (const item of itens) {
-    // Nao permite estoque negativo.
     comandos.push(env.DB.prepare(`
       UPDATE estoque
-      SET quantidade = CASE
-            WHEN quantidade >= ?
-            THEN quantidade - ?
-            ELSE NULL
-          END,
-          atualizado_em = CURRENT_TIMESTAMP
+      SET
+        quantidade = CASE
+          WHEN quantidade >= ?
+          THEN quantidade - ?
+          ELSE NULL
+        END,
+        atualizado_em = CURRENT_TIMESTAMP
       WHERE produto_id = ?
         AND CAST(tamanho AS TEXT) = ?
     `).bind(
@@ -497,7 +539,11 @@ export async function onRequestPost({ request, env }) {
       item.tamanho
     ));
 
-    // Falha se nao existir a numeracao.
+    /*
+     * Impede confirmacao se a numeracao
+     * nao existir no estoque.
+     */
+
     comandos.push(env.DB.prepare(`
       INSERT INTO estoque (
         produto_id,
@@ -518,8 +564,6 @@ export async function onRequestPost({ request, env }) {
   }
 
   try {
-    // D1.batch executa em transacao.
-    // Se um comando falhar, ocorre rollback.
     await env.DB.batch(comandos);
   } catch (erro) {
     console.error(
@@ -529,7 +573,7 @@ export async function onRequestPost({ request, env }) {
         : String(erro)
     );
 
-    return json({
+    return responder({
       erro: "Confirmacao inconclusa",
       pedidoId: pedido.id,
       mensagem:
@@ -543,7 +587,7 @@ export async function onRequestPost({ request, env }) {
     orderId
   });
 
-  return json({
+  return responder({
     recebido: true,
     pedidoId: pedido.id,
     referencia: pedido.referencia,
@@ -559,7 +603,7 @@ export async function onRequestPost({ request, env }) {
 }
 
 export function onRequestGet() {
-  return json({
+  return responder({
     erro: "Metodo nao permitido. Utilize POST."
   }, 405);
 }

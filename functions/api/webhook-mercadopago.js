@@ -1,189 +1,41 @@
 
 /*
  * URBAN KICKS
- * WEBHOOK MERCADO PAGO - PIX
+ * Mercado Pago - Webhook PIX e Cartao
  * Cloudflare Pages Functions + D1
  *
- * POST /api/webhook-mercadopago
+ * Rota: POST /api/webhook-mercadopago
  *
- * Ambiente: SANDBOX
- * Referencia: UK-MP-
+ * Seguranca:
+ * - Valida assinatura HMAC do Mercado Pago
+ * - Consulta a order diretamente na API
+ * - Confere pedido, valores e pagamento
+ * - Confirma PIX ou cartao de credito
+ * - Desconta estoque somente uma vez
+ * - Utiliza transacao atomica no D1
  *
- * Verifica assinatura HMAC-SHA256.
- * Consulta a Order diretamente no Mercado Pago.
- * Confere o pagamento antes de confirmar.
- * Atualiza pedido e estoque em lote atomico.
- * Protege contra notificacoes duplicadas.
+ * Requer:
+ * env.DB
+ * env.MERCADOPAGO_ACCESS_TOKEN
+ * env.MERCADOPAGO_WEBHOOK_SECRET
  *
- * Nao modifica os arquivos PagBank.
- *
- * IMPORTANTE:
- * Integracao em fase de testes.
- * Nao habilitar pagamentos reais sem
- * validar a resposta da Orders API.
+ * Ambiente atual: SANDBOX
  */
 
-const MP_API =
-  "https://api.mercadopago.com/v1/orders/";
-
-const AMBIENTE = "SANDBOX";
-const PREFIXO = "UK-MP-";
-
-const LIMITE_CORPO = 100000;
+const MP_API = "https://api.mercadopago.com/v1/orders/";
 
 function responder(dados, status = 200) {
-  return Response.json(dados, {
+  return new Response(JSON.stringify(dados), {
     status,
     headers: {
-      "Cache-Control": "no-store"
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff"
     }
   });
 }
 
-function identificadorValido(valor) {
-  return (
-    typeof valor === "string" &&
-    valor.length >= 1 &&
-    valor.length <= 128 &&
-    /^[A-Za-z0-9_-]+$/.test(valor)
-  );
-}
-
-function compararSeguro(a, b) {
-  if (
-    typeof a !== "string" ||
-    typeof b !== "string" ||
-    a.length !== b.length
-  ) {
-    return false;
-  }
-
-  let diferenca = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    diferenca |= (
-      a.charCodeAt(i) ^
-      b.charCodeAt(i)
-    );
-  }
-
-  return diferenca === 0;
-}
-
-async function validarAssinatura(
-  request,
-  segredo
-) {
-  const url = new URL(request.url);
-
-  const id =
-    url.searchParams.get("data.id");
-
-  const assinatura =
-    request.headers.get("x-signature");
-
-  const requestId =
-    request.headers.get("x-request-id");
-
-  if (
-    !identificadorValido(id) ||
-    !assinatura ||
-    !requestId ||
-    requestId.length > 200
-  ) {
-    return null;
-  }
-
-  const partes = {};
-
-  for (
-    const parte of assinatura.split(",")
-  ) {
-    const posicao = parte.indexOf("=");
-
-    if (posicao > 0) {
-      const chave = parte
-        .slice(0, posicao)
-        .trim();
-
-      const valor = parte
-        .slice(posicao + 1)
-        .trim();
-
-      partes[chave] = valor;
-    }
-  }
-
-  const ts = partes.ts;
-  const v1 = partes.v1;
-
-  if (
-    !/^\d{10,16}$/.test(ts || "") ||
-    !/^[a-f0-9]{64}$/i.test(v1 || "")
-  ) {
-    return null;
-  }
-
-  const numeroTs = Number(ts);
-
-  const instante =
-    ts.length <= 10
-      ? numeroTs * 1000
-      : numeroTs;
-
-  if (
-    !Number.isFinite(instante) ||
-    Math.abs(Date.now() - instante) >
-      600000
-  ) {
-    return null;
-  }
-
-  const manifesto =
-    "id:" + id.toLowerCase() + ";" +
-    "request-id:" + requestId + ";" +
-    "ts:" + ts + ";";
-
-  const chave = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(segredo),
-    {
-      name: "HMAC",
-      hash: "SHA-256"
-    },
-    false,
-    ["sign"]
-  );
-
-  const resultado =
-    await crypto.subtle.sign(
-      "HMAC",
-      chave,
-      new TextEncoder().encode(
-        manifesto
-      )
-    );
-
-  const hexadecimal = Array.from(
-    new Uint8Array(resultado)
-  ).map(
-    byte =>
-      byte.toString(16).padStart(2, "0")
-  ).join("");
-
-  if (
-    !compararSeguro(
-      hexadecimal,
-      v1.toLowerCase()
-    )
-  ) {
-    return null;
-  }
-
-  return id;
-}
-
-function converterCentavos(valor) {
+function centavos(valor) {
   if (
     typeof valor !== "string" &&
     typeof valor !== "number"
@@ -193,406 +45,372 @@ function converterCentavos(valor) {
 
   const texto = String(valor);
 
-  if (
-    !/^\d{1,12}(\.\d{1,2})?$/.test(
-      texto
-    )
-  ) {
+  if (!/^\d{1,12}(\.\d{1,2})?$/.test(texto)) {
     return null;
   }
 
   const partes = texto.split(".");
-
-  const reais = Number(partes[0]);
-
-  const centavos = Number(
+  const inteiro = Number(partes[0]);
+  const decimal = Number(
     (partes[1] || "").padEnd(2, "0")
   );
 
-  const total =
-    reais * 100 + centavos;
+  const resultado = inteiro * 100 + decimal;
 
-  return Number.isSafeInteger(total)
-    ? total
+  return Number.isSafeInteger(resultado)
+    ? resultado
     : null;
 }
 
-async function consultarOrder(
-  orderId,
-  token
-) {
-  const resposta = await fetch(
-    MP_API + encodeURIComponent(orderId),
-    {
-      method: "GET",
-      headers: {
-        Authorization:
-          "Bearer " + token,
-        Accept: "application/json"
-      },
-      signal: AbortSignal.timeout(12000)
+function hexParaBytes(hex) {
+  if (!/^[0-9a-f]{64}$/i.test(hex)) {
+    return null;
+  }
+
+  const bytes = new Uint8Array(32);
+
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+
+  return bytes;
+}
+
+function comparacaoConstante(a, b) {
+  if (!a || !b || a.length !== b.length) {
+    return false;
+  }
+
+  let diferenca = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    diferenca |= a[i] ^ b[i];
+  }
+
+  return diferenca === 0;
+}
+
+async function validarAssinatura(request, secret, id) {
+  const assinatura = request.headers.get("x-signature");
+  const requestId = request.headers.get("x-request-id");
+
+  if (!assinatura || !requestId || !secret || !id) {
+    return false;
+  }
+
+  const campos = {};
+
+  for (const parte of assinatura.split(",")) {
+    const posicao = parte.indexOf("=");
+
+    if (posicao > 0) {
+      campos[
+        parte.slice(0, posicao).trim()
+      ] = parte.slice(posicao + 1).trim();
     }
+  }
+
+  const ts = campos.ts;
+  const v1 = campos.v1;
+
+  if (!/^\d{10,16}$/.test(ts || "")) {
+    return false;
+  }
+
+  const assinaturaRecebida = hexParaBytes(v1 || "");
+
+  if (!assinaturaRecebida) {
+    return false;
+  }
+
+  /*
+   * O Mercado Pago documenta timestamps em
+   * milissegundos. Aceitamos segundos tambem
+   * para compatibilidade, mas nunca dispensamos
+   * a verificacao criptografica.
+   */
+
+  const numeroTs = Number(ts);
+  const instante =
+    ts.length <= 10 ? numeroTs * 1000 : numeroTs;
+
+  if (
+    !Number.isFinite(instante) ||
+    Math.abs(Date.now() - instante) >
+      10 * 60 * 1000
+  ) {
+    return false;
+  }
+
+  const manifesto =
+    "id:" +
+    id.toLowerCase() +
+    ";request-id:" +
+    requestId +
+    ";ts:" +
+    ts +
+    ";";
+
+  const encoder = new TextEncoder();
+
+  const chave = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    {
+      name: "HMAC",
+      hash: "SHA-256"
+    },
+    false,
+    ["sign"]
   );
 
-  if (!resposta.ok) {
-    throw new Error(
-      "Mercado Pago HTTP " +
-      resposta.status
-    );
-  }
+  const assinaturaCalculada = new Uint8Array(
+    await crypto.subtle.sign(
+      "HMAC",
+      chave,
+      encoder.encode(manifesto)
+    )
+  );
 
-  return resposta.json();
+  return comparacaoConstante(
+    assinaturaRecebida,
+    assinaturaCalculada
+  );
 }
 
-async function buscarPedido(
-  DB,
-  referencia,
-  orderId
-) {
-  return DB.prepare(`
-    SELECT
-      id,
-      referencia,
-      checkout_id,
-      status,
-      valor_total,
-      ambiente
-    FROM pedidos
-    WHERE referencia = ?
-      AND checkout_id = ?
-      AND ambiente = ?
-      AND referencia LIKE 'UK-MP-%'
-    LIMIT 1
-  `).bind(
-    referencia,
-    orderId,
-    AMBIENTE
-  ).first();
-}
-
-async function buscarItens(DB, pedido) {
-  const resultado = await DB.prepare(`
-    SELECT
-      produto_id,
-      CAST(tamanho AS TEXT) AS tamanho,
-      SUM(quantidade) AS quantidade,
-      SUM(
-        quantidade * preco_unitario
-      ) AS subtotal
-    FROM pedido_itens
-    WHERE pedido_id = ?
-    GROUP BY
-      produto_id,
-      CAST(tamanho AS TEXT)
-  `).bind(
-    pedido.id
-  ).all();
-
-  const itens = resultado.results || [];
+function identificarMetodo(pagamento) {
+  const metodo = pagamento?.payment_method || {};
 
   if (
-    itens.length < 1 ||
-    itens.length > 20
+    metodo.id === "pix" &&
+    metodo.type === "bank_transfer"
   ) {
-    throw new Error(
-      "Quantidade de itens invalida"
-    );
-  }
-
-  let total = 0;
-
-  for (const item of itens) {
-    if (
-      !Number.isSafeInteger(
-        item.produto_id
-      ) ||
-      item.produto_id < 1 ||
-      !/^(3[4-9]|4[0-4])$/.test(
-        item.tamanho
-      ) ||
-      !Number.isSafeInteger(
-        item.quantidade
-      ) ||
-      item.quantidade < 1 ||
-      item.quantidade > 5 ||
-      !Number.isSafeInteger(
-        item.subtotal
-      ) ||
-      item.subtotal <= 0
-    ) {
-      throw new Error(
-        "Item do pedido invalido"
-      );
-    }
-
-    total += item.subtotal;
+    return "pix";
   }
 
   if (
-    !Number.isSafeInteger(total) ||
-    total !== pedido.valor_total
+    metodo.type === "credit_card" &&
+    typeof metodo.id === "string" &&
+    metodo.id.length > 0
   ) {
-    throw new Error(
-      "Valor dos itens divergente"
-    );
+    return "credit_card";
   }
 
-  return itens;
+  return null;
 }
 
-function pagamentoConfirmado(
-  order,
-  pedido
-) {
+function pagamentoAprovado(ordem) {
   if (
-    order?.status !== "processed" ||
-    order?.status_detail !== "accredited"
+    ordem?.status !== "processed" ||
+    ordem?.status_detail !== "accredited"
   ) {
-    return {
-      confirmado: false,
-      pendente: true
-    };
+    return null;
   }
 
-  const pagamentos =
-    order?.transactions?.payments;
+  const pagamentos = ordem?.transactions?.payments;
 
   if (
     !Array.isArray(pagamentos) ||
     pagamentos.length !== 1
   ) {
-    return {
-      confirmado: false,
-      erro: "Quantidade de pagamentos invalida"
-    };
+    return null;
   }
 
   const pagamento = pagamentos[0];
 
-  const pagamentoId =
-    String(pagamento?.id ?? "");
-
   if (
-    !identificadorValido(pagamentoId) ||
-    pagamento?.status !== "processed" ||
-    pagamento?.status_detail !== "accredited"
+    pagamento.status !== "processed" ||
+    pagamento.status_detail !== "accredited"
   ) {
-    return {
-      confirmado: false,
-      erro: "Pagamento nao validado"
-    };
+    return null;
   }
 
-  /*
-   * Confirmacao conservadora:
-   * campos ausentes ou divergentes
-   * impedem a baixa automatica.
-   */
+  const metodo = identificarMetodo(pagamento);
 
-  const valores = [
-    order?.total_amount,
-    order?.total_paid_amount,
-    pagamento?.amount,
-    pagamento?.paid_amount
-  ];
-
-  if (
-    order?.currency_id !== "BRL" ||
-    !Number.isSafeInteger(
-      pedido.valor_total
-    ) ||
-    pedido.valor_total <= 0 ||
-    valores.some(
-      valor =>
-        converterCentavos(valor) !==
-        pedido.valor_total
-    )
-  ) {
-    return {
-      confirmado: false,
-      erro:
-        "Moeda ou valores inconsistentes"
-    };
+  if (!metodo) {
+    return null;
   }
 
-  const metodo =
-    pagamento?.payment_method;
+  const idPagamento = String(pagamento.id || "");
 
-  if (
-    metodo?.id !== "pix" ||
-    metodo?.type !== "bank_transfer"
-  ) {
-    return {
-      confirmado: false,
-      erro: "Metodo de pagamento divergente"
-    };
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(idPagamento)) {
+    return null;
   }
 
   return {
-    confirmado: true,
-    pagamentoId,
-    metodo: "pix"
+    id: idPagamento,
+    metodo,
+    pagamento
   };
 }
 
-/*
- * Guarda SQL:
- *
- * Se a condicao nao for atendida,
- * tenta inserir NULL em uma coluna
- * NOT NULL, provocando erro.
- *
- * O DB.batch do D1 executa as
- * instrucoes em transacao atomica.
- * Se uma falhar, o lote e revertido.
- */
+async function consultarOrder(orderId, token) {
+  const resposta = await fetch(
+    MP_API + encodeURIComponent(orderId),
+    {
+      method: "GET",
+      headers: {
+        Authorization: "Bearer " + token,
+        Accept: "application/json"
+      }
+    }
+  );
 
-function guarda(DB, condicao, parametros) {
-  return DB.prepare(`
-    INSERT INTO pedidos (
-      referencia,
-      status,
-      valor_total,
-      ambiente
-    )
-    SELECT
-      NULL,
-      'INVALIDO',
-      0,
-      'SANDBOX'
-    WHERE NOT (${condicao})
-  `).bind(...parametros);
+  if (!resposta.ok) {
+    console.error(
+      "MP_CONSULTA_FALHOU",
+      resposta.status
+    );
+
+    return null;
+  }
+
+  return resposta.json();
 }
 
-async function confirmarNoBanco(
-  DB,
+async function obterPedido(db, orderId) {
+  return db.prepare(
+    `SELECT id, referencia, checkout_id,
+            status, valor_total, ambiente
+     FROM pedidos
+     WHERE checkout_id = ?
+       AND ambiente = 'SANDBOX'
+       AND referencia LIKE 'UK-MP-%'
+     LIMIT 1`
+  ).bind(orderId).first();
+}
+
+async function obterItens(db, pedidoId) {
+  const resultado = await db.prepare(
+    `SELECT produto_id,
+            tamanho,
+            SUM(quantidade) AS quantidade,
+            SUM(quantidade * preco_unitario)
+              AS subtotal
+     FROM pedido_itens
+     WHERE pedido_id = ?
+     GROUP BY produto_id, tamanho`
+  ).bind(pedidoId).all();
+
+  return resultado.results || [];
+}
+
+async function finalizarPedido(
+  db,
   pedido,
   orderId,
-  pagamentoId,
+  pagamento,
   itens
 ) {
   const comandos = [];
 
   /*
-   * Protege contra confirmacao repetida
-   * e mudanca de status concorrente.
+   * GUARDA TRANSACIONAL
+   *
+   * Caso o pedido nao esteja PENDENTE,
+   * a instrucao provoca erro de constraint.
+   * O D1.batch desfaz toda a transacao.
    */
 
   comandos.push(
-    guarda(
-      DB,
-      `EXISTS (
-        SELECT 1
-        FROM pedidos
-        WHERE id = ?
-          AND referencia = ?
-          AND checkout_id = ?
-          AND ambiente = 'SANDBOX'
-          AND status = 'PENDENTE'
-      )`,
-      [
-        pedido.id,
-        pedido.referencia,
-        orderId
-      ]
-    )
+    db.prepare(
+      `INSERT INTO pedidos
+        (referencia, status, valor_total, ambiente)
+       SELECT NULL, 'INVALIDO', 0, 'SANDBOX'
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM pedidos
+         WHERE id = ?
+           AND checkout_id = ?
+           AND status = 'PENDENTE'
+           AND ambiente = 'SANDBOX'
+       )`
+    ).bind(pedido.id, orderId)
   );
 
   /*
-   * Confere estoque de todos os itens
-   * antes de qualquer desconto.
+   * Verifica estoque dentro da transacao.
+   * Nao permite quantidade negativa.
    */
 
   for (const item of itens) {
     comandos.push(
-      guarda(
-        DB,
-        `EXISTS (
-          SELECT 1
-          FROM estoque
-          WHERE produto_id = ?
-            AND CAST(tamanho AS TEXT) = ?
-            AND quantidade >= ?
-        )`,
-        [
-          item.produto_id,
-          item.tamanho,
-          item.quantidade
-        ]
+      db.prepare(
+        `INSERT INTO pedidos
+          (referencia, status, valor_total, ambiente)
+         SELECT NULL, 'INVALIDO', 0, 'SANDBOX'
+         WHERE (
+           SELECT COALESCE(SUM(quantidade), 0)
+           FROM estoque
+           WHERE produto_id = ?
+             AND tamanho = ?
+         ) < ?`
+      ).bind(
+        item.produto_id,
+        item.tamanho,
+        item.quantidade
       )
     );
   }
 
   /*
-   * Registro unico do pagamento.
-   * A tabela possui UNIQUE(pedido_id)
-   * e UNIQUE(order_id).
+   * Registra o pagamento aprovado.
+   * A tabela possui UNIQUE em pedido_id,
+   * order_id e pagamento_id.
    */
 
   comandos.push(
-    DB.prepare(`
-      INSERT INTO pagamentos_mercadopago (
-        pedido_id,
-        order_id,
-        pagamento_id,
-        valor,
-        moeda,
-        status,
-        metodo
-      )
-      VALUES (
-        ?,
-        ?,
-        ?,
-        ?,
-        'BRL',
-        'PAGO',
-        'pix'
-      )
-    `).bind(
+    db.prepare(
+      `INSERT INTO pagamentos_mercadopago
+        (pedido_id, order_id, pagamento_id,
+         valor, moeda, status, metodo)
+       VALUES (?, ?, ?, ?, 'BRL',
+               'APROVADO', ?)`
+    ).bind(
       pedido.id,
       orderId,
-      pagamentoId,
-      pedido.valor_total
+      pagamento.id,
+      pedido.valor_total,
+      pagamento.metodo
     )
   );
 
   comandos.push(
-    DB.prepare(`
-      UPDATE pedidos
-      SET
-        status = 'PAGO',
-        atualizado_em =
-          CURRENT_TIMESTAMP
-      WHERE id = ?
-        AND referencia = ?
-        AND checkout_id = ?
-        AND ambiente = 'SANDBOX'
-        AND status = 'PENDENTE'
-    `).bind(
-      pedido.id,
-      pedido.referencia,
-      orderId
-    )
+    db.prepare(
+      `UPDATE pedidos
+       SET status = 'PAGO',
+           atualizado_em = CURRENT_TIMESTAMP
+       WHERE id = ?
+         AND checkout_id = ?
+         AND status = 'PENDENTE'
+         AND ambiente = 'SANDBOX'`
+    ).bind(pedido.id, orderId)
   );
 
   /*
-   * Baixa estoque por produto/tamanho.
+   * Atualiza o estoque somente depois
+   * das guardas e do registro do pagamento.
+   *
+   * Cada produto/tamanho deve possuir
+   * um unico registro de estoque.
    */
 
   for (const item of itens) {
     comandos.push(
-      DB.prepare(`
-        UPDATE estoque
-        SET
-          quantidade =
-            quantidade - ?,
-          atualizado_em =
-            CURRENT_TIMESTAMP
-        WHERE produto_id = ?
-          AND CAST(tamanho AS TEXT) = ?
-          AND quantidade >= ?
-      `).bind(
+      db.prepare(
+        `UPDATE estoque
+         SET quantidade = quantidade - ?,
+             atualizado_em = CURRENT_TIMESTAMP
+         WHERE id = (
+           SELECT id
+           FROM estoque
+           WHERE produto_id = ?
+             AND tamanho = ?
+           ORDER BY id
+           LIMIT 1
+         )
+         AND quantidade >= ?`
+      ).bind(
         item.quantidade,
         item.produto_id,
         item.tamanho,
@@ -601,317 +419,330 @@ async function confirmarNoBanco(
     );
   }
 
-  await DB.batch(comandos);
+  await db.batch(comandos);
 }
 
-export async function onRequestPost({
-  request,
-  env
-}) {
+export async function onRequestPost(context) {
+  const { request, env } = context;
+
   if (
     !env.DB ||
     !env.MERCADOPAGO_ACCESS_TOKEN ||
     !env.MERCADOPAGO_WEBHOOK_SECRET
   ) {
-    return responder({
-      erro: "Configuracao incompleta"
-    }, 503);
+    return responder(
+      { erro: "Configuracao indisponivel." },
+      503
+    );
   }
-
-  const tamanho = Number(
-    request.headers.get(
-      "content-length"
-    ) || 0
-  );
-
-  if (
-    !Number.isFinite(tamanho) ||
-    tamanho > LIMITE_CORPO
-  ) {
-    return responder({
-      erro: "Notificacao muito grande"
-    }, 413);
-  }
-
-  let corpo;
 
   try {
-    corpo = await request.text();
-  } catch {
-    return responder({
-      erro: "Falha ao ler notificacao"
-    }, 400);
-  }
+    const url = new URL(request.url);
 
-  if (
-    !corpo ||
-    new TextEncoder()
-      .encode(corpo).length >
-      LIMITE_CORPO
-  ) {
-    return responder({
-      erro: "Corpo invalido"
-    }, 400);
-  }
+    const orderId =
+      url.searchParams.get("data.id") ||
+      url.searchParams.get("data_id");
 
-  let orderId;
+    const tipo = url.searchParams.get("type");
 
-  try {
-    orderId = await validarAssinatura(
+    if (tipo !== "order") {
+      return responder({
+        recebido: true,
+        ignorado: true
+      });
+    }
+
+    if (
+      !orderId ||
+      !/^[a-zA-Z0-9_-]{1,128}$/.test(orderId)
+    ) {
+      return responder(
+        { erro: "Identificador invalido." },
+        400
+      );
+    }
+
+    const assinaturaValida = await validarAssinatura(
       request,
-      env.MERCADOPAGO_WEBHOOK_SECRET
-    );
-  } catch (erro) {
-    console.error(
-      "MP_ASSINATURA",
-      String(erro)
-    );
-
-    return responder({
-      erro:
-        "Falha ao validar assinatura"
-    }, 503);
-  }
-
-  if (!orderId) {
-    return responder({
-      erro:
-        "Assinatura invalida ou expirada"
-    }, 401);
-  }
-
-  let evento;
-
-  try {
-    evento = JSON.parse(corpo);
-  } catch {
-    return responder({
-      erro: "JSON invalido"
-    }, 400);
-  }
-
-  if (
-    evento?.type !== "order" ||
-    evento?.live_mode !== false ||
-    String(evento?.data?.id ?? "") !==
+      env.MERCADOPAGO_WEBHOOK_SECRET,
       orderId
-  ) {
-    return responder({
-      erro:
-        "Evento de teste invalido"
-    }, 400);
-  }
+    );
 
-  let order;
+    if (!assinaturaValida) {
+      return responder(
+        { erro: "Assinatura invalida." },
+        401
+      );
+    }
 
-  try {
-    order = await consultarOrder(
+    const evento = await request.json().catch(
+      () => null
+    );
+
+    if (
+      !evento ||
+      evento.type !== "order" ||
+      String(evento.data?.id || "") !== orderId
+    ) {
+      return responder(
+        { erro: "Notificacao inconsistente." },
+        400
+      );
+    }
+
+    if (evento.live_mode !== false) {
+      return responder(
+        { erro: "Ambiente de pagamento incorreto." },
+        403
+      );
+    }
+
+    const pedido = await obterPedido(env.DB, orderId);
+
+    if (!pedido) {
+      return responder(
+        { erro: "Pedido nao localizado." },
+        404
+      );
+    }
+
+    if (pedido.status === "PAGO") {
+      return responder({
+        recebido: true,
+        processado: true,
+        duplicado: true
+      });
+    }
+
+    if (pedido.status !== "PENDENTE") {
+      return responder({
+        recebido: true,
+        processado: false,
+        status: pedido.status
+      });
+    }
+
+    /*
+     * Nao confia no status enviado pelo webhook.
+     * Consulta a API oficial do Mercado Pago.
+     */
+
+    const ordem = await consultarOrder(
       orderId,
       env.MERCADOPAGO_ACCESS_TOKEN
     );
-  } catch (erro) {
-    console.error(
-      "MP_CONSULTA_ORDER",
-      String(erro)
-    );
 
-    return responder({
-      erro:
-        "Falha ao consultar Order"
-    }, 503);
-  }
+    if (!ordem) {
+      return responder(
+        { erro: "Falha ao consultar pagamento." },
+        503
+      );
+    }
 
-  const referencia =
-    order?.external_reference;
+    if (
+      String(ordem.id || "") !== orderId ||
+      ordem.external_reference !== pedido.referencia
+    ) {
+      console.error("MP_DIVERGENCIA_PEDIDO");
 
-  if (
-    String(order?.id ?? "") !==
-      orderId ||
-    typeof referencia !== "string" ||
-    !referencia.startsWith(PREFIXO)
-  ) {
-    return responder({
-      erro: "Order inconsistente"
-    }, 409);
-  }
+      return responder(
+        { erro: "Divergencia no pedido." },
+        409
+      );
+    }
 
-  let pedido;
+    const confirmado = pagamentoAprovado(ordem);
 
-  try {
-    pedido = await buscarPedido(
-      env.DB,
-      referencia,
-      orderId
-    );
-  } catch (erro) {
-    console.error(
-      "MP_BUSCAR_PEDIDO",
-      String(erro)
-    );
-
-    return responder({
-      erro:
-        "Falha ao consultar pedido"
-    }, 503);
-  }
-
-  if (!pedido) {
-    return responder({
-      erro: "Pedido nao encontrado"
-    }, 404);
-  }
-
-  if (pedido.status === "PAGO") {
-    return responder({
-      recebido: true,
-      pedidoId: pedido.id,
-      status: "PAGO",
-      jaProcessado: true,
-      estoqueAlterado: false
-    });
-  }
-
-  if (
-    pedido.status !== "PENDENTE"
-  ) {
-    return responder({
-      recebido: true,
-      pedidoId: pedido.id,
-      status: pedido.status,
-      processado: false
-    });
-  }
-
-  const validacao =
-    pagamentoConfirmado(
-      order,
-      pedido
-    );
-
-  if (validacao.pendente) {
-    return responder({
-      recebido: true,
-      pedidoId: pedido.id,
-      status: "PENDENTE",
-      pagamentoConfirmado: false,
-      estoqueAlterado: false
-    });
-  }
-
-  if (!validacao.confirmado) {
-    console.error(
-      "MP_PAGAMENTO_NAO_VALIDADO",
-      validacao.erro
-    );
-
-    return responder({
-      erro:
-        "Pagamento exige revisao",
-      motivo: validacao.erro,
-      processado: false
-    }, 409);
-  }
-
-  let itens;
-
-  try {
-    itens = await buscarItens(
-      env.DB,
-      pedido
-    );
-  } catch (erro) {
-    console.error(
-      "MP_ITENS",
-      String(erro)
-    );
-
-    return responder({
-      erro:
-        "Itens do pedido inconsistentes"
-    }, 409);
-  }
-
-  try {
-    await confirmarNoBanco(
-      env.DB,
-      pedido,
-      orderId,
-      validacao.pagamentoId,
-      itens
-    );
-  } catch (erro) {
-    console.error(
-      "MP_CONFIRMACAO_D1",
-      String(erro)
-    );
+    if (!confirmado) {
+      return responder({
+        recebido: true,
+        processado: false,
+        status: ordem.status || "pendente"
+      });
+    }
 
     /*
-     * Uma notificacao concorrente
-     * pode ter confirmado o pedido.
-     * Consulta novamente antes
-     * de informar falha.
+     * Conferencia financeira.
+     * Os valores devem ser identicos
+     * aos valores calculados no servidor.
      */
 
+    const totalOrder = centavos(ordem.total_amount);
+
+    const valorPagamento = centavos(
+      confirmado.pagamento.amount
+    );
+
+    const valorPago = centavos(
+      confirmado.pagamento.paid_amount
+    );
+
+    if (
+      totalOrder !== pedido.valor_total ||
+      valorPagamento !== pedido.valor_total ||
+      valorPago !== pedido.valor_total ||
+      ordem.currency_id !== "BRL"
+    ) {
+      console.error(
+        "MP_DIVERGENCIA_VALORES",
+        pedido.id
+      );
+
+      return responder(
+        { erro: "Valores do pagamento divergentes." },
+        409
+      );
+    }
+
+    const itens = await obterItens(
+      env.DB,
+      pedido.id
+    );
+
+    if (!itens.length) {
+      return responder(
+        { erro: "Pedido sem itens." },
+        409
+      );
+    }
+
+    const soma = itens.reduce(
+      (total, item) =>
+        total + Number(item.subtotal),
+      0
+    );
+
+    if (soma !== pedido.valor_total) {
+      return responder(
+        { erro: "Itens e total divergentes." },
+        409
+      );
+    }
+
+    for (const item of itens) {
+      if (
+        !Number.isInteger(Number(item.quantidade)) ||
+        Number(item.quantidade) <= 0
+      ) {
+        return responder(
+          { erro: "Quantidade invalida." },
+          409
+        );
+      }
+    }
+
+    /*
+     * Exige uma linha unica de estoque por
+     * produto e tamanho, pois a baixa
+     * acontece sobre uma unica linha.
+     */
+
+    for (const item of itens) {
+      const estoque = await env.DB.prepare(
+        `SELECT COUNT(*) AS registros,
+                COALESCE(SUM(quantidade), 0)
+                  AS disponivel
+         FROM estoque
+         WHERE produto_id = ?
+           AND tamanho = ?`
+      ).bind(
+        item.produto_id,
+        item.tamanho
+      ).first();
+
+      if (
+        Number(estoque?.registros) !== 1 ||
+        Number(estoque?.disponivel) <
+          Number(item.quantidade)
+      ) {
+        console.error(
+          "MP_ESTOQUE_INDISPONIVEL",
+          pedido.id
+        );
+
+        return responder(
+          {
+            erro: "Pagamento aprovado, mas estoque requer revisao.",
+            pedidoId: pedido.id
+          },
+          503
+        );
+      }
+    }
+
     try {
-      const atual = await buscarPedido(
+      await finalizarPedido(
         env.DB,
-        referencia,
+        pedido,
+        orderId,
+        confirmado,
+        itens
+      );
+    } catch (erro) {
+      console.error(
+        "MP_FINALIZACAO_FALHOU",
+        pedido.id,
+        erro?.message || "Erro D1"
+      );
+
+      /*
+       * Pode ser notificacao simultanea.
+       * Confere o estado atual antes de
+       * retornar erro.
+       */
+
+      const atual = await obterPedido(
+        env.DB,
         orderId
       );
 
-      if (
-        atual?.status === "PAGO"
-      ) {
+      if (atual?.status === "PAGO") {
         return responder({
           recebido: true,
-          pedidoId: atual.id,
-          status: "PAGO",
-          jaProcessado: true,
-          estoqueAlterado: false
+          processado: true,
+          duplicado: true
         });
       }
-    } catch {
-      // Mantem resposta de falha.
+
+      return responder(
+        {
+          erro: "Pedido aprovado requer conciliacao.",
+          pedidoId: pedido.id
+        },
+        503
+      );
     }
+
+    console.log(
+      "MP_PAGAMENTO_CONFIRMADO",
+      pedido.id,
+      confirmado.metodo
+    );
 
     return responder({
-      erro:
-        "Confirmacao inconclusa",
+      recebido: true,
+      processado: true,
       pedidoId: pedido.id,
-      mensagem:
-        "Verifique pagamento e estoque no D1."
-    }, 503);
+      status: "PAGO",
+      metodo: confirmado.metodo
+    });
+
+  } catch (erro) {
+    console.error(
+      "MP_WEBHOOK_ERRO",
+      erro?.message || "Erro inesperado"
+    );
+
+    return responder(
+      { erro: "Erro interno no webhook." },
+      500
+    );
   }
-
-  console.log(
-    "MP_PEDIDO_CONFIRMADO",
-    {
-      pedidoId: pedido.id,
-      referencia,
-      orderId
-    }
-  );
-
-  return responder({
-    recebido: true,
-    pedidoId: pedido.id,
-    referencia,
-    status: "PAGO",
-    pagamentoConfirmado: true,
-    estoqueAlterado: true,
-    produtosAtualizados:
-      itens.map(item => ({
-        produtoId: item.produto_id,
-        tamanho: item.tamanho,
-        quantidadeDescontada:
-          item.quantidade
-      }))
-  });
 }
 
-export function onRequestGet() {
-  return responder({
-    erro:
-      "Metodo nao permitido. Utilize POST."
-  }, 405);
+export async function onRequestGet() {
+  return responder(
+    { erro: "Metodo nao permitido. Utilize POST." },
+    405
+  );
 }

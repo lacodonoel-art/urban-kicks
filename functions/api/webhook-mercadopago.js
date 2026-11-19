@@ -180,12 +180,8 @@ async function validarAssinatura(
   );
 
   /*
-   * O Mercado Pago documenta o ID em
-   * minusculas para a assinatura.
-   *
-   * Tambem testamos o ID original para
-   * diagnosticar possiveis diferencas
-   * no simulador.
+   * Testa o identificador em minusculas
+   * e o identificador original.
    *
    * Nenhuma variante dispensa HMAC valido.
    */
@@ -407,12 +403,12 @@ async function finalizarPedido(
   comandos.push(
     db.prepare(
       `INSERT INTO pedidos
-        (
-          referencia,
-          status,
-          valor_total,
-          ambiente
-        )
+       (
+         referencia,
+         status,
+         valor_total,
+         ambiente
+       )
        SELECT
          NULL,
          'INVALIDO',
@@ -440,12 +436,12 @@ async function finalizarPedido(
     comandos.push(
       db.prepare(
         `INSERT INTO pedidos
-          (
-            referencia,
-            status,
-            valor_total,
-            ambiente
-          )
+         (
+           referencia,
+           status,
+           valor_total,
+           ambiente
+         )
          SELECT
            NULL,
            'INVALIDO',
@@ -470,23 +466,20 @@ async function finalizarPedido(
 
   /*
    * Registro unico do pagamento.
-   *
-   * A tabela pagamentos_mercadopago
-   * possui UNIQUE para pedido e order.
    */
 
   comandos.push(
     db.prepare(
       `INSERT INTO pagamentos_mercadopago
-        (
-          pedido_id,
-          order_id,
-          pagamento_id,
-          valor,
-          moeda,
-          status,
-          metodo
-        )
+       (
+         pedido_id,
+         order_id,
+         pagamento_id,
+         valor,
+         moeda,
+         status,
+         metodo
+       )
        VALUES (
          ?, ?, ?, ?,
          'BRL',
@@ -520,9 +513,6 @@ async function finalizarPedido(
 
   /*
    * Baixa de estoque.
-   *
-   * Exige um registro unico por
-   * produto e tamanho.
    */
 
   for (const item of itens) {
@@ -782,10 +772,16 @@ export async function onRequestPost(context) {
       valorPago !== pedido.valor_total ||
       ordem.currency_id !== "BRL"
     ) {
-      console.error(
-        "MP_DIVERGENCIA_VALORES",
-        pedido.id
-      );
+      // DIAGNOSTICO DETALHADO DOS VALORES
+      // Nao registra tokens ou dados sensiveis.
+      console.error("MP_DIVERGENCIA_VALORES", {
+        pedidoId: pedido.id,
+        totalPedido: pedido.valor_total,
+        totalOrder,
+        valorPagamento,
+        valorPago,
+        moeda: ordem.currency_id ?? null
+      });
 
       return responder(
         {

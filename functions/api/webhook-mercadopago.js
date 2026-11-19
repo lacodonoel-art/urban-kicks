@@ -95,6 +95,7 @@ async function validarAssinatura(request, secret, id) {
   const requestId = request.headers.get("x-request-id");
 
   if (!assinatura || !requestId || !secret || !id) {
+    console.error("MP_ASSINATURA_CABECALHO_AUSENTE");
     return false;
   }
 
@@ -114,21 +115,21 @@ async function validarAssinatura(request, secret, id) {
   const v1 = campos.v1;
 
   if (!/^\d{10,16}$/.test(ts || "")) {
-    return false;
-  }
-
-  const assinaturaRecebida = hexParaBytes(v1 || "");
-
-  if (!assinaturaRecebida) {
+    console.error("MP_ASSINATURA_TIMESTAMP_INVALIDO");
     return false;
   }
 
   /*
-   * O Mercado Pago documenta timestamps em
-   * milissegundos. Aceitamos segundos tambem
-   * para compatibilidade, mas nunca dispensamos
-   * a verificacao criptografica.
+   * Aceita timestamps em segundos ou milissegundos,
+   * sem dispensar a verificacao criptografica.
    */
+
+  const assinaturaRecebida = hexParaBytes(v1 || "");
+
+  if (!assinaturaRecebida) {
+    console.error("MP_ASSINATURA_FORMATO_INVALIDO");
+    return false;
+  }
 
   const numeroTs = Number(ts);
   const instante =
@@ -139,6 +140,7 @@ async function validarAssinatura(request, secret, id) {
     Math.abs(Date.now() - instante) >
       10 * 60 * 1000
   ) {
+    console.error("MP_ASSINATURA_HORARIO_INVALIDO");
     return false;
   }
 
@@ -172,10 +174,16 @@ async function validarAssinatura(request, secret, id) {
     )
   );
 
-  return comparacaoConstante(
+  const valida = comparacaoConstante(
     assinaturaRecebida,
     assinaturaCalculada
   );
+
+  if (!valida) {
+    console.error("MP_ASSINATURA_HMAC_DIVERGENTE");
+  }
+
+  return valida;
 }
 
 function identificarMetodo(pagamento) {

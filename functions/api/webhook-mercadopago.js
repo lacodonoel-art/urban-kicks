@@ -6,16 +6,12 @@
  *
  * Ambiente: SANDBOX
  *
- * Validacao HMAC:
- * - Identificador em minusculas
- * - Identificador original
- * - Nunca ignora assinatura invalida
- *
- * Pagamentos:
- * - Consulta a API oficial
- * - Confere pedido e valores
- * - Impede processamento duplicado
- * - Atualiza estoque em transacao D1
+ * Validacao:
+ * - Assinatura HMAC obrigatoria
+ * - Consulta da ordem na API oficial
+ * - Conferencia de pedido, moeda e valores
+ * - Protecao contra pagamento duplicado
+ * - Atualizacao transacional do estoque
  */
 
 const MP_API = "https://api.mercadopago.com/v1/orders/";
@@ -89,11 +85,7 @@ function comparacaoConstante(a, b) {
   return diferenca === 0;
 }
 
-async function validarAssinatura(
-  request,
-  secret,
-  id
-) {
+async function validarAssinatura(request, secret, id) {
   const assinatura = request.headers.get(
     "x-signature"
   );
@@ -179,13 +171,6 @@ async function validarAssinatura(
     ["sign"]
   );
 
-  /*
-   * Testa o identificador em minusculas
-   * e o identificador original.
-   *
-   * Nenhuma variante dispensa HMAC valido.
-   */
-
   const identificadores = [
     {
       nome: "MINUSCULO",
@@ -234,11 +219,7 @@ async function validarAssinatura(
 
   if (!assinaturaValida) {
     console.error(
-      "MP_ASSINATURA_HMAC_DIVERGENTE",
-      "VARIANTES_TESTADAS:",
-      identificadores.map(
-        item => item.nome
-      ).join(",")
+      "MP_ASSINATURA_HMAC_DIVERGENTE"
     );
 
     return false;
@@ -394,10 +375,8 @@ async function finalizarPedido(
 
   /*
    * Guarda transacional.
-   *
    * Se o pedido nao estiver pendente,
-   * provoca uma falha de constraint.
-   * A transacao inteira e revertida.
+   * provoca falha de constraint e rollback.
    */
 
   comandos.push(
@@ -593,10 +572,6 @@ export async function onRequestPost(context) {
       );
     }
 
-    /*
-     * Assinatura obrigatoria.
-     */
-
     const assinaturaValida =
       await validarAssinatura(
         request,
@@ -612,10 +587,6 @@ export async function onRequestPost(context) {
         401
       );
     }
-
-    /*
-     * Confere o corpo da notificacao.
-     */
 
     const evento = await request.json().catch(
       () => null
@@ -655,10 +626,6 @@ export async function onRequestPost(context) {
         403
       );
     }
-
-    /*
-     * Localiza o pedido no D1.
-     */
 
     const pedido = await obterPedido(
       env.DB,
@@ -700,7 +667,6 @@ export async function onRequestPost(context) {
 
     /*
      * Consulta a API oficial.
-     * Nunca confia apenas no webhook.
      */
 
     const ordem = await consultarOrder(
@@ -734,10 +700,6 @@ export async function onRequestPost(context) {
       );
     }
 
-    /*
-     * Confirma pagamento aprovado.
-     */
-
     const confirmado = pagamentoAprovado(
       ordem
     );
@@ -766,21 +728,36 @@ export async function onRequestPost(context) {
       confirmado.pagamento.paid_amount
     );
 
+    /*
+     * CORRECAO:
+     * A resposta GET da API Orders pode
+     * nao trazer currency_id na raiz.
+     *
+     * Nesse caso, usamos a moeda informada
+     * no evento assinado do Mercado Pago.
+     *
+     * Continuamos exigindo BRL e conferindo
+     * todos os valores com a API oficial.
+     */
+
+    const moeda =
+      ordem.currency_id ??
+      evento.data?.currency_id ??
+      null;
+
     if (
       totalOrder !== pedido.valor_total ||
       valorPagamento !== pedido.valor_total ||
       valorPago !== pedido.valor_total ||
-      ordem.currency_id !== "BRL"
+      moeda !== "BRL"
     ) {
-      // DIAGNOSTICO DETALHADO DOS VALORES
-      // Nao registra tokens ou dados sensiveis.
       console.error("MP_DIVERGENCIA_VALORES", {
         pedidoId: pedido.id,
         totalPedido: pedido.valor_total,
         totalOrder,
         valorPagamento,
         valorPago,
-        moeda: ordem.currency_id ?? null
+        moeda
       });
 
       return responder(

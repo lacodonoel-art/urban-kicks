@@ -51,7 +51,7 @@ function montarTurnstile(){
     message.textContent='Não foi possível carregar a verificação de segurança.';
   }
 }
-// MERCADO PAGO - ambiente de integracao
+// MERCADO PAGO - integracao com endpoint de producao (bloqueado ate validacao)
 // Public Key publica; Access Token nunca deve estar no HTML.
 const MP_PUBLIC_KEY = 'APP_USR-0cc71140-4bc5-47f3-9273-2f261d061ad1';
 let mpBrickController = null;
@@ -78,7 +78,7 @@ function alternarMetodoMP(){
  if(cartao)iniciarBrickCartao();
 }
 async function mpEnviar(payload){
- const resposta=await fetch('/api/checkout-mercadopago',{
+ const resposta=await fetch('/api/checkout-mercadopago-producao',{
   method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)
  });
  const resultado=await resposta.json().catch(()=>({}));

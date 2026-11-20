@@ -413,14 +413,48 @@ export async function onRequestPost(context) {
       console.error(
         "MP_ERRO_API",
         respostaMP.status,
-        ordem.error || ordem.code || "Erro nao especificado"
+        JSON.stringify({
+          error: ordem.error || null,
+          code: ordem.code || null,
+          message: ordem.message || null,
+          cause: ordem.cause || null
+        }).slice(0, 1500),
+        "referencia:", referencia
       );
+
+      // Somente respostas 4xx definitivas podem ser classificadas como
+      // rejeicao. Em 5xx/429 a API pode ter criado o pagamento: manter
+      // PREPARANDO para conciliacao e impedir cobranca duplicada.
+      const rejeicaoDefinitiva =
+        respostaMP.status >= 400 &&
+        respostaMP.status < 500 &&
+        respostaMP.status !== 408 &&
+        respostaMP.status !== 409 &&
+        respostaMP.status !== 425 &&
+        respostaMP.status !== 429;
+
+      if (rejeicaoDefinitiva) {
+        try {
+          await env.DB.prepare(
+            `UPDATE pedidos
+             SET status = 'FALHA', atualizado_em = CURRENT_TIMESTAMP
+             WHERE referencia = ? AND ambiente = 'PRODUCAO'
+               AND status = 'PREPARANDO' AND checkout_id IS NULL`
+          ).bind(referencia).run();
+        } catch (erroAtualizacao) {
+          console.error("MP_FALHA_REGISTRAR_REJEICAO", referencia,
+            erroAtualizacao?.message || "Erro D1");
+        }
+      }
 
       return responder(
         {
-          erro: "Mercado Pago nao aceitou a solicitacao.",
+          erro: "Mercado Pago nao concluiu a solicitacao.",
           referencia,
-          codigo: respostaMP.status
+          codigo: respostaMP.status,
+          mensagem: rejeicaoDefinitiva
+            ? "Solicitacao rejeitada. Verifique os dados antes de tentar novamente."
+            : "Resultado incerto. Verifique o pedido antes de tentar pagar novamente."
         },
         502
       );

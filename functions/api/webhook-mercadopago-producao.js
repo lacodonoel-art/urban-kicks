@@ -1,17 +1,13 @@
 
 /*
  * URBAN KICKS
- * Webhook Mercado Pago - PIX e Cartao
+ * Webhook Mercado Pago - Producao
+ * PIX + Cartao de credito
  * Cloudflare Pages Functions + D1
  *
- * Ambiente: PRODUCAO
- *
- * Validacao:
- * - Assinatura HMAC obrigatoria
- * - Consulta da ordem na API oficial
- * - Conferencia de pedido, moeda e valores
- * - Protecao contra pagamento duplicado
- * - Atualizacao transacional do estoque
+ * IMPORTANTE:
+ * Manter URBAN_KICKS_PRODUCAO_HABILITADA = NAO
+ * ate concluir os testes.
  */
 
 const MP_API = "https://api.mercadopago.com/v1/orders/";
@@ -31,9 +27,7 @@ function centavos(valor) {
   if (
     typeof valor !== "string" &&
     typeof valor !== "number"
-  ) {
-    return null;
-  }
+  ) return null;
 
   const texto = String(valor);
 
@@ -55,9 +49,7 @@ function centavos(valor) {
 }
 
 function hexParaBytes(hex) {
-  if (!/^[0-9a-f]{64}$/i.test(hex)) {
-    return null;
-  }
+  if (!/^[0-9a-f]{64}$/i.test(hex)) return null;
 
   const bytes = new Uint8Array(32);
 
@@ -86,18 +78,10 @@ function comparacaoConstante(a, b) {
 }
 
 async function validarAssinatura(request, secret, id) {
-  const assinatura = request.headers.get(
-    "x-signature"
-  );
-
-  const requestId = request.headers.get(
-    "x-request-id"
-  );
+  const assinatura = request.headers.get("x-signature");
+  const requestId = request.headers.get("x-request-id");
 
   if (!assinatura || !requestId || !secret || !id) {
-    console.error(
-      "MP_ASSINATURA_CABECALHO_AUSENTE"
-    );
     return false;
   }
 
@@ -107,14 +91,8 @@ async function validarAssinatura(request, secret, id) {
     const posicao = parte.indexOf("=");
 
     if (posicao > 0) {
-      const nome = parte
-        .slice(0, posicao)
-        .trim();
-
-      const valor = parte
-        .slice(posicao + 1)
-        .trim();
-
+      const nome = parte.slice(0, posicao).trim();
+      const valor = parte.slice(posicao + 1).trim();
       campos[nome] = valor;
     }
   }
@@ -123,38 +101,21 @@ async function validarAssinatura(request, secret, id) {
   const v1 = campos.v1;
 
   if (!/^\d{10,16}$/.test(ts || "")) {
-    console.error(
-      "MP_ASSINATURA_TIMESTAMP_INVALIDO"
-    );
     return false;
   }
 
-  const assinaturaRecebida = hexParaBytes(
-    v1 || ""
-  );
+  const recebida = hexParaBytes(v1 || "");
 
-  if (!assinaturaRecebida) {
-    console.error(
-      "MP_ASSINATURA_FORMATO_INVALIDO"
-    );
-    return false;
-  }
+  if (!recebida) return false;
 
   const numeroTs = Number(ts);
-
   const instante =
-    ts.length <= 10
-      ? numeroTs * 1000
-      : numeroTs;
+    ts.length <= 10 ? numeroTs * 1000 : numeroTs;
 
   if (
     !Number.isFinite(instante) ||
-    Math.abs(Date.now() - instante) >
-      10 * 60 * 1000
+    Math.abs(Date.now() - instante) > 600000
   ) {
-    console.error(
-      "MP_ASSINATURA_HORARIO_INVALIDO"
-    );
     return false;
   }
 
@@ -171,34 +132,19 @@ async function validarAssinatura(request, secret, id) {
     ["sign"]
   );
 
-  const identificadores = [
-    {
-      nome: "MINUSCULO",
-      valor: id.toLowerCase()
-    }
-  ];
+  const ids = [id.toLowerCase()];
 
   if (id !== id.toLowerCase()) {
-    identificadores.push({
-      nome: "ORIGINAL",
-      valor: id
-    });
+    ids.push(id);
   }
 
-  let assinaturaValida = false;
-  let varianteValida = null;
-
-  for (const identificador of identificadores) {
+  for (const identificador of ids) {
     const manifesto =
-      "id:" +
-      identificador.valor +
-      ";request-id:" +
-      requestId +
-      ";ts:" +
-      ts +
-      ";";
+      "id:" + identificador +
+      ";request-id:" + requestId +
+      ";ts:" + ts + ";";
 
-    const assinaturaCalculada = new Uint8Array(
+    const calculada = new Uint8Array(
       await crypto.subtle.sign(
         "HMAC",
         chave,
@@ -206,31 +152,12 @@ async function validarAssinatura(request, secret, id) {
       )
     );
 
-    const corresponde = comparacaoConstante(
-      assinaturaRecebida,
-      assinaturaCalculada
-    );
-
-    if (corresponde) {
-      assinaturaValida = true;
-      varianteValida = identificador.nome;
+    if (comparacaoConstante(recebida, calculada)) {
+      return true;
     }
   }
 
-  if (!assinaturaValida) {
-    console.error(
-      "MP_ASSINATURA_HMAC_DIVERGENTE"
-    );
-
-    return false;
-  }
-
-  console.log(
-    "MP_ASSINATURA_VALIDA",
-    varianteValida
-  );
-
-  return true;
+  return false;
 }
 
 function identificarMetodo(pagamento) {
@@ -262,8 +189,7 @@ function pagamentoAprovado(ordem) {
     return null;
   }
 
-  const pagamentos =
-    ordem?.transactions?.payments;
+  const pagamentos = ordem?.transactions?.payments;
 
   if (
     !Array.isArray(pagamentos) ||
@@ -283,32 +209,24 @@ function pagamentoAprovado(ordem) {
 
   const metodo = identificarMetodo(pagamento);
 
-  if (!metodo) {
-    return null;
-  }
+  if (!metodo) return null;
 
-  const idPagamento = String(
-    pagamento.id || ""
-  );
+  const id = String(pagamento.id || "");
 
-  if (
-    !/^[a-zA-Z0-9_-]{1,128}$/.test(
-      idPagamento
-    )
-  ) {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(id)) {
     return null;
   }
 
   return {
-    id: idPagamento,
+    id,
     metodo,
     pagamento
   };
 }
 
-async function consultarOrder(orderId, token) {
+async function consultarOrdem(id, token) {
   const resposta = await fetch(
-    MP_API + encodeURIComponent(orderId),
+    MP_API + encodeURIComponent(id),
     {
       method: "GET",
       headers: {
@@ -323,7 +241,6 @@ async function consultarOrder(orderId, token) {
       "MP_CONSULTA_FALHOU",
       resposta.status
     );
-
     return null;
   }
 
@@ -331,38 +248,51 @@ async function consultarOrder(orderId, token) {
 }
 
 async function obterPedido(db, orderId) {
-  return db.prepare(
-    `SELECT
-       id,
-       referencia,
-       checkout_id,
-       status,
-       valor_total,
-       ambiente
-     FROM pedidos
-     WHERE checkout_id = ?
-       AND ambiente = 'PRODUCAO'
-       AND referencia LIKE 'UK-MP-%'
-     LIMIT 1`
-  ).bind(orderId).first();
+  return db.prepare(`
+    SELECT
+      id,
+      referencia,
+      checkout_id,
+      status,
+      valor_total,
+      ambiente
+    FROM pedidos
+    WHERE checkout_id = ?
+      AND ambiente = 'PRODUCAO'
+      AND referencia LIKE 'UK-MP-%'
+    LIMIT 1
+  `).bind(orderId).first();
 }
 
 async function obterItens(db, pedidoId) {
-  const resultado = await db.prepare(
-    `SELECT
-       produto_id,
-       tamanho,
-       SUM(quantidade) AS quantidade,
-       SUM(
-         quantidade * preco_unitario
-       ) AS subtotal
-     FROM pedido_itens
-     WHERE pedido_id = ?
-     GROUP BY produto_id, tamanho`
-  ).bind(pedidoId).all();
+  const resultado = await db.prepare(`
+    SELECT
+      produto_id,
+      tamanho,
+      SUM(quantidade) AS quantidade,
+      SUM(quantidade * preco_unitario) AS subtotal
+    FROM pedido_itens
+    WHERE pedido_id = ?
+    GROUP BY produto_id, tamanho
+  `).bind(pedidoId).all();
 
   return resultado.results || [];
 }
+
+/*
+ * Finalizacao transacional.
+ *
+ * db.batch executa as instrucoes em transacao.
+ *
+ * Os comandos de guarda usam uma violacao
+ * intencional de NOT NULL para cancelar
+ * toda a transacao quando a condicao falha.
+ *
+ * Isso depende da estrutura D1 conferida:
+ * pedidos.referencia e NOT NULL.
+ * estoque.quantidade tem CHECK >= 0.
+ * estoque tem UNIQUE(produto_id, tamanho).
+ */
 
 async function finalizarPedido(
   db,
@@ -373,69 +303,38 @@ async function finalizarPedido(
 ) {
   const comandos = [];
 
-  /*
-   * Guarda transacional.
-   * Se o pedido nao estiver pendente,
-   * provoca falha de constraint e rollback.
-   */
-
+  // Guarda: somente pedido pendente.
   comandos.push(
-    db.prepare(
-      `INSERT INTO pedidos
-       (
-         referencia,
-         status,
-         valor_total,
-         ambiente
-       )
-       SELECT
-         NULL,
-         'INVALIDO',
-         0,
-         'PRODUCAO'
-       WHERE NOT EXISTS (
-         SELECT 1
-         FROM pedidos
-         WHERE id = ?
-           AND checkout_id = ?
-           AND status = 'PENDENTE'
-           AND ambiente = 'PRODUCAO'
-       )`
-    ).bind(
-      pedido.id,
-      orderId
-    )
+    db.prepare(`
+      INSERT INTO pedidos
+        (referencia, status, valor_total, ambiente)
+      SELECT NULL, 'INVALIDO', 0, 'PRODUCAO'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM pedidos
+        WHERE id = ?
+          AND checkout_id = ?
+          AND status = 'PENDENTE'
+          AND ambiente = 'PRODUCAO'
+      )
+    `).bind(pedido.id, orderId)
   );
 
-  /*
-   * Verificacao de estoque na transacao.
-   */
-
+  // Guarda: todos os itens precisam ter
+  // exatamente um registro de estoque.
   for (const item of itens) {
     comandos.push(
-      db.prepare(
-        `INSERT INTO pedidos
-         (
-           referencia,
-           status,
-           valor_total,
-           ambiente
-         )
-         SELECT
-           NULL,
-           'INVALIDO',
-           0,
-           'PRODUCAO'
-         WHERE (
-           SELECT COALESCE(
-             SUM(quantidade),
-             0
-           )
-           FROM estoque
-           WHERE produto_id = ?
-             AND tamanho = ?
-         ) < ?`
-      ).bind(
+      db.prepare(`
+        INSERT INTO pedidos
+          (referencia, status, valor_total, ambiente)
+        SELECT NULL, 'INVALIDO', 0, 'PRODUCAO'
+        WHERE (
+          SELECT COUNT(*)
+          FROM estoque
+          WHERE produto_id = ?
+            AND tamanho = ?
+            AND quantidade >= ?
+        ) <> 1
+      `).bind(
         item.produto_id,
         item.tamanho,
         item.quantidade
@@ -443,29 +342,26 @@ async function finalizarPedido(
     );
   }
 
-  /*
-   * Registro unico do pagamento.
-   */
-
+  // Registro unico do pagamento.
   comandos.push(
-    db.prepare(
-      `INSERT INTO pagamentos_mercadopago
-       (
-         pedido_id,
-         order_id,
-         pagamento_id,
-         valor,
-         moeda,
-         status,
-         metodo
-       )
-       VALUES (
-         ?, ?, ?, ?,
-         'BRL',
-         'APROVADO',
-         ?
-       )`
-    ).bind(
+    db.prepare(`
+      INSERT INTO pagamentos_mercadopago
+        (
+          pedido_id,
+          order_id,
+          pagamento_id,
+          valor,
+          moeda,
+          status,
+          metodo
+        )
+      VALUES (
+        ?, ?, ?, ?,
+        'BRL',
+        'APROVADO',
+        ?
+      )
+    `).bind(
       pedido.id,
       orderId,
       pagamento.id,
@@ -474,75 +370,65 @@ async function finalizarPedido(
     )
   );
 
-  comandos.push(
-    db.prepare(
-      `UPDATE pedidos
-       SET
-         status = 'PAGO',
-         atualizado_em = CURRENT_TIMESTAMP
-       WHERE id = ?
-         AND checkout_id = ?
-         AND status = 'PENDENTE'
-         AND ambiente = 'PRODUCAO'`
-    ).bind(
-      pedido.id,
-      orderId
-    )
-  );
-
-  /*
-   * Baixa de estoque.
-   */
-
+  // Baixa de estoque.
+  // CHECK(quantidade >= 0) cancela
+  // a transacao se houver falta de estoque.
   for (const item of itens) {
     comandos.push(
-      db.prepare(
-        `UPDATE estoque
-         SET
-           quantidade = quantidade - ?,
-           atualizado_em = CURRENT_TIMESTAMP
-         WHERE id = (
-           SELECT id
-           FROM estoque
-           WHERE produto_id = ?
-             AND tamanho = ?
-           ORDER BY id
-           LIMIT 1
-         )
-         AND quantidade >= ?`
-      ).bind(
+      db.prepare(`
+        UPDATE estoque
+        SET
+          quantidade = quantidade - ?,
+          atualizado_em = CURRENT_TIMESTAMP
+        WHERE produto_id = ?
+          AND tamanho = ?
+      `).bind(
         item.quantidade,
         item.produto_id,
-        item.tamanho,
-        item.quantidade
+        item.tamanho
       )
     );
   }
+
+  // Pedido pago somente na mesma transacao.
+  comandos.push(
+    db.prepare(`
+      UPDATE pedidos
+      SET
+        status = 'PAGO',
+        atualizado_em = CURRENT_TIMESTAMP
+      WHERE id = ?
+        AND checkout_id = ?
+        AND status = 'PENDENTE'
+        AND ambiente = 'PRODUCAO'
+    `).bind(pedido.id, orderId)
+  );
 
   await db.batch(comandos);
 }
 
 export async function onRequestPost(context) {
-  if (context.env.URBAN_KICKS_PRODUCAO_HABILITADA !== "SIM") {
-    return responder({ erro: "Webhook de producao ainda nao habilitado." }, 503);
-  }
   const { request, env } = context;
+
+  // Bloqueio de seguranca.
+  if (
+    env.URBAN_KICKS_PRODUCAO_HABILITADA !== "SIM"
+  ) {
+    return responder({
+      erro: "Webhook de producao ainda nao habilitado."
+    }, 503);
+  }
 
   if (
     !env.DB ||
     !env.MERCADOPAGO_ACCESS_TOKEN_PRODUCAO ||
     !env.MERCADOPAGO_WEBHOOK_SECRET_PRODUCAO
   ) {
-    console.error(
-      "MP_CONFIGURACAO_INDISPONIVEL"
-    );
+    console.error("MP_CONFIGURACAO_INDISPONIVEL");
 
-    return responder(
-      {
-        erro: "Configuracao indisponivel."
-      },
-      503
-    );
+    return responder({
+      erro: "Configuracao indisponivel."
+    }, 503);
   }
 
   try {
@@ -563,32 +449,23 @@ export async function onRequestPost(context) {
 
     if (
       !orderId ||
-      !/^[a-zA-Z0-9_-]{1,128}$/.test(
-        orderId
-      )
+      !/^[a-zA-Z0-9_-]{1,128}$/.test(orderId)
     ) {
-      return responder(
-        {
-          erro: "Identificador invalido."
-        },
-        400
-      );
+      return responder({
+        erro: "Identificador invalido."
+      }, 400);
     }
 
-    const assinaturaValida =
-      await validarAssinatura(
-        request,
-        env.MERCADOPAGO_WEBHOOK_SECRET_PRODUCAO,
-        orderId
-      );
+    const assinaturaValida = await validarAssinatura(
+      request,
+      env.MERCADOPAGO_WEBHOOK_SECRET_PRODUCAO,
+      orderId
+    );
 
     if (!assinaturaValida) {
-      return responder(
-        {
-          erro: "Assinatura invalida."
-        },
-        401
-      );
+      return responder({
+        erro: "Assinatura invalida."
+      }, 401);
     }
 
     const evento = await request.json().catch(
@@ -598,36 +475,17 @@ export async function onRequestPost(context) {
     if (
       !evento ||
       evento.type !== "order" ||
-      String(evento.data?.id || "") !==
-        orderId
+      String(evento.data?.id || "") !== orderId
     ) {
-      console.error(
-        "MP_NOTIFICACAO_INCONSISTENTE"
-      );
-
-      return responder(
-        {
-          erro: "Notificacao inconsistente."
-        },
-        400
-      );
+      return responder({
+        erro: "Notificacao inconsistente."
+      }, 400);
     }
 
-    /*
-     * Somente ambiente de testes.
-     */
-
     if (evento.live_mode !== true) {
-      console.error(
-        "MP_AMBIENTE_INCORRETO"
-      );
-
-      return responder(
-        {
-          erro: "Ambiente de pagamento incorreto."
-        },
-        403
-      );
+      return responder({
+        erro: "Ambiente de pagamento incorreto."
+      }, 403);
     }
 
     const pedido = await obterPedido(
@@ -636,21 +494,10 @@ export async function onRequestPost(context) {
     );
 
     if (!pedido) {
-      console.error(
-        "MP_PEDIDO_NAO_LOCALIZADO"
-      );
-
-      return responder(
-        {
-          erro: "Pedido nao localizado."
-        },
-        404
-      );
+      return responder({
+        erro: "Pedido nao localizado."
+      }, 404);
     }
-
-    /*
-     * Protecao contra duplicidade.
-     */
 
     if (pedido.status === "PAGO") {
       return responder({
@@ -668,44 +515,27 @@ export async function onRequestPost(context) {
       });
     }
 
-    /*
-     * Consulta a API oficial.
-     */
-
-    const ordem = await consultarOrder(
+    const ordem = await consultarOrdem(
       orderId,
       env.MERCADOPAGO_ACCESS_TOKEN_PRODUCAO
     );
 
     if (!ordem) {
-      return responder(
-        {
-          erro: "Falha ao consultar pagamento."
-        },
-        503
-      );
+      return responder({
+        erro: "Falha ao consultar pagamento."
+      }, 503);
     }
 
     if (
       String(ordem.id || "") !== orderId ||
-      ordem.external_reference !==
-        pedido.referencia
+      ordem.external_reference !== pedido.referencia
     ) {
-      console.error(
-        "MP_DIVERGENCIA_PEDIDO"
-      );
-
-      return responder(
-        {
-          erro: "Divergencia no pedido."
-        },
-        409
-      );
+      return responder({
+        erro: "Divergencia no pedido."
+      }, 409);
     }
 
-    const confirmado = pagamentoAprovado(
-      ordem
-    );
+    const confirmado = pagamentoAprovado(ordem);
 
     if (!confirmado) {
       return responder({
@@ -715,11 +545,8 @@ export async function onRequestPost(context) {
       });
     }
 
-    /*
-     * Conferencia financeira.
-     */
-
-    const totalOrder = centavos(
+    // Conferencia dos valores.
+    const totalOrdem = centavos(
       ordem.total_amount
     );
 
@@ -731,111 +558,76 @@ export async function onRequestPost(context) {
       confirmado.pagamento.paid_amount
     );
 
-    /*
-     * CORRECAO:
-     * A resposta GET da API Orders pode
-     * nao trazer currency_id na raiz.
-     *
-     * Nesse caso, usamos a moeda informada
-     * no evento assinado do Mercado Pago.
-     *
-     * Continuamos exigindo BRL e conferindo
-     * todos os valores com a API oficial.
-     */
-
     const moeda =
       ordem.currency_id ??
       evento.data?.currency_id ??
       null;
 
     if (
-      totalOrder !== pedido.valor_total ||
+      totalOrdem === null ||
+      totalOrdem !== pedido.valor_total ||
       valorPagamento !== pedido.valor_total ||
       valorPago !== pedido.valor_total ||
       moeda !== "BRL"
     ) {
-      console.error("MP_DIVERGENCIA_VALORES", {
-        pedidoId: pedido.id,
-        totalPedido: pedido.valor_total,
-        totalOrder,
-        valorPagamento,
-        valorPago,
-        moeda
-      });
-
-      return responder(
-        {
-          erro: "Valores do pagamento divergentes."
-        },
-        409
+      console.error(
+        "MP_DIVERGENCIA_VALORES",
+        pedido.id
       );
+
+      return responder({
+        erro: "Valores do pagamento divergentes."
+      }, 409);
     }
 
-    /*
-     * Confere os itens do pedido.
-     */
-
+    // Conferencia dos itens.
     const itens = await obterItens(
       env.DB,
       pedido.id
     );
 
     if (!itens.length) {
-      return responder(
-        {
-          erro: "Pedido sem itens."
-        },
-        409
-      );
+      return responder({
+        erro: "Pedido sem itens."
+      }, 409);
     }
 
-    const soma = itens.reduce(
-      (total, item) =>
-        total + Number(item.subtotal),
-      0
-    );
+    let soma = 0;
+
+    for (const item of itens) {
+      const quantidade = Number(item.quantidade);
+      const subtotal = Number(item.subtotal);
+
+      if (
+        !Number.isSafeInteger(quantidade) ||
+        quantidade <= 0 ||
+        !Number.isSafeInteger(subtotal) ||
+        subtotal < 0
+      ) {
+        return responder({
+          erro: "Itens invalidos."
+        }, 409);
+      }
+
+      soma += subtotal;
+    }
 
     if (soma !== pedido.valor_total) {
-      return responder(
-        {
-          erro: "Itens e total divergentes."
-        },
-        409
-      );
+      return responder({
+        erro: "Itens e total divergentes."
+      }, 409);
     }
 
+    // Verificacao previa de estoque.
     for (const item of itens) {
-      if (
-        !Number.isInteger(
-          Number(item.quantidade)
-        ) ||
-        Number(item.quantidade) <= 0
-      ) {
-        return responder(
-          {
-            erro: "Quantidade invalida."
-          },
-          409
-        );
-      }
-    }
-
-    /*
-     * Verifica estoque disponivel.
-     */
-
-    for (const item of itens) {
-      const estoque = await env.DB.prepare(
-        `SELECT
-           COUNT(*) AS registros,
-           COALESCE(
-             SUM(quantidade),
-             0
-           ) AS disponivel
-         FROM estoque
-         WHERE produto_id = ?
-           AND tamanho = ?`
-      ).bind(
+      const estoque = await env.DB.prepare(`
+        SELECT
+          COUNT(*) AS registros,
+          COALESCE(SUM(quantidade), 0) AS disponivel
+        FROM estoque
+        WHERE produto_id = ?
+          AND tamanho = ?
+      `).bind(
         item.produto_id,
         item.tamanho
       ).first();
@@ -850,21 +642,14 @@ export async function onRequestPost(context) {
           pedido.id
         );
 
-        return responder(
-          {
-            erro:
-              "Pagamento aprovado, mas estoque requer revisao.",
-            pedidoId: pedido.id
-          },
-          503
-        );
+        return responder({
+          erro: "Pagamento aprovado requer conciliacao.",
+          pedidoId: pedido.id
+        }, 503);
       }
     }
 
-    /*
-     * Finaliza pedido e estoque.
-     */
-
+    // Finalizacao atomica no D1.
     try {
       await finalizarPedido(
         env.DB,
@@ -893,14 +678,10 @@ export async function onRequestPost(context) {
         });
       }
 
-      return responder(
-        {
-          erro:
-            "Pedido aprovado requer conciliacao.",
-          pedidoId: pedido.id
-        },
-        503
-      );
+      return responder({
+        erro: "Pedido aprovado requer conciliacao.",
+        pedidoId: pedido.id
+      }, 503);
     }
 
     console.log(
@@ -923,21 +704,14 @@ export async function onRequestPost(context) {
       erro?.message || "Erro inesperado"
     );
 
-    return responder(
-      {
-        erro: "Erro interno no webhook."
-      },
-      500
-    );
+    return responder({
+      erro: "Erro interno no webhook."
+    }, 500);
   }
 }
 
 export async function onRequestGet() {
-  return responder(
-    {
-      erro:
-        "Metodo nao permitido. Utilize POST."
-    },
-    405
-  );
+  return responder({
+    erro: "Metodo nao permitido. Utilize POST."
+  }, 405);
 }
